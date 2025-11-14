@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QSlider
 )
 from PyQt5.QtWidgets import QLabel as QLabelWidget
-from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtGui import QPixmap, QImage, QPainter
 from PyQt5.QtCore import Qt
 
 from src import DinoSegmenter
@@ -117,17 +117,20 @@ class InteractiveSegmenterApp(QWidget):
         self.image_path = self.images[index]
 
         # Load the image using PIL
-        pil_image = Image.open(self.image_path).convert("RGB")
+        pil_image = Image.open(self.image_path).convert("RGBA")
         self.image_rgb = np.array(pil_image)
 
         # Store original size
         self.original_h, self.original_w = self.image_rgb.shape[:2]
 
-        # Create a dimmed version for the overlay
-        self.image_dimmed = (self.image_rgb * 0.5).astype(np.uint8)
-
         # Initialize display image
         self.display_image = self.image_rgb.copy()
+
+        # Create original pixmap
+        height, width, channel = self.display_image.shape
+        bytes_per_line = 4 * width
+        q_img = QImage(self.display_image.data, width, height, bytes_per_line, QImage.Format_RGBA8888)
+        self.original_pixmap = QPixmap.fromImage(q_img)
 
         # Update window title
         title = (
@@ -138,32 +141,57 @@ class InteractiveSegmenterApp(QWidget):
 
     def update_display(self):
         """Updates the display with prompts and mask overlay if available."""
-        self.display_image = self.image_rgb.copy()
+        # 1. Get the final, full-resolution mask from the segmenter
+        #    (This is already aligned with the original image)
+        if self.segmenter.prompts:
+            confidence_map = self.segmenter.predict_mask()
+            final_mask = self.segmenter.post_process_mask(
+                confidence_map, threshold=self.threshold
+            )  # e.g., (1920, 1080)
 
-        # Draw prompts
+        # 2. Create pixmap with prompts
+        self.display_image = self.image_rgb.copy()
+        # Draw prompts on RGB channels
         for prompt in self.app_prompts:
             y, x = prompt['coords']
             color = (0, 255, 0) if prompt['label'] == 1 else (255, 0, 0)  # Green for positive, red for negative
-            cv2.circle(self.display_image, (x, y), 5, color, -1)
+            temp_rgb = self.display_image[:, :, :3].copy()
+            cv2.circle(temp_rgb, (x, y), 5, color, -1)
+            self.display_image[:, :, :3] = temp_rgb
+        height, width, channel = self.display_image.shape
+        bytes_per_line = 4 * width
+        q_img = QImage(self.display_image.data, width, height, bytes_per_line, QImage.Format_RGBA8888)
+        current_pixmap = QPixmap.fromImage(q_img)
+        self.image_label.setPixmap(current_pixmap)
 
-        # If there are prompts, predict and overlay mask
+        # 3. If there are prompts, overlay the mask
         if self.segmenter.prompts:
             try:
-                confidence_map = self.segmenter.predict_mask()
-                final_mask = self.segmenter.post_process_mask(confidence_map, threshold=self.threshold)
-                # Overlay
-                highlight_color = np.array([255, 255, 255], dtype=np.uint8)  # White overlay
-                highlight_mask = final_mask[..., None] * highlight_color
-                self.display_image = cv2.add(self.display_image, highlight_mask.astype(np.uint8))
+                # Convert the numpy mask to a QImage
+                mask_uint8 = (final_mask * 255).astype(np.uint8)
+                H, W = final_mask.shape
+                q_image_mask = QImage(mask_uint8.data, W, H, W, QImage.Format_Grayscale8)
+                
+                # 4. Get the size of the widget
+                widget_size = self.image_label.size()
+                
+                # 5. Scale the mask
+                scaled_mask = q_image_mask.scaled(
+                    widget_size, 
+                    Qt.IgnoreAspectRatio,  # Stretch to fill
+                    Qt.FastTransformation
+                )
+                
+                # 6. Create overlay pixmap
+                overlay_pixmap = QPixmap.fromImage(scaled_mask)
+                
+                # 7. Apply overlay
+                painter = QPainter(self.image_label.pixmap())
+                painter.setOpacity(0.5)
+                painter.drawPixmap(0, 0, overlay_pixmap)
+                painter.end()
             except Exception as e:
-                print(f"Error during mask prediction: {e}")
-
-        # Convert numpy array to QImage
-        height, width, channel = self.display_image.shape
-        bytes_per_line = 3 * width
-        q_img = QImage(self.display_image.data, width, height, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(q_img)
-        self.image_label.setPixmap(pixmap)
+                print(f"Error during mask overlay: {e}")
 
     def handle_mouse_press(self, event):
         """Handle mouse press event for adding prompts."""
