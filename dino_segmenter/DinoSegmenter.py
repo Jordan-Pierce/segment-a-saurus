@@ -11,9 +11,12 @@ pretrained_model_names = [
     "facebook/dinov2-base",
     "facebook/dinov2-large",
     "facebook/dinov2-giant",
+    
     "facebook/dinov3-vits16plus-pretrain-lvd1689m"
     "facebook/dinov3-vits16-pretrain-lvd1689m",
     "facebook/dinov3-vit7b16-pretrain-lvd1689m",
+    
+    "facebook/dinov3-convnext-tiny-pretrain-lvd1689m"
 ]
             
 
@@ -25,7 +28,7 @@ class DinoSegmenter:
     """
     
     def __init__(self, 
-                 pretrained_model_name: str = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m", 
+                 pretrained_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m", 
                  device: str = None, 
                  max_resolution: int = 1024):
         """
@@ -135,40 +138,39 @@ class DinoSegmenter:
         # --- 4. Apply the transforms ---
         img_tensor = high_res_transforms(img_pil).to(self.device, torch.float16).unsqueeze(0)
         
+        B, C, H_proc, W_proc = img_tensor.shape
+        h_grid = H_proc // self.patch_size
+        w_grid = W_proc // self.patch_size
+        self.grid_size = (h_grid, w_grid)
+        n_patches = h_grid * w_grid
+
         # --- 5. Run the model on the high-res tensor ---
         out = self.model(pixel_values=img_tensor)
-        hs = out.last_hidden_state
+        hs = out.last_hidden_state # Shape [B, SeqLen, C]
         
-        # --- 6. START: THE FIX ---
-        # Get the *actual* grid size and patch features from the output
-        
-        if self.is_vit:
-            # ViT output is [B, SeqLen, C].
-            # We must calculate n_patches based on the *input tensor shape*
-            # and then grab the tokens.
-            B, C, H_proc, W_proc = img_tensor.shape
-            h_grid = H_proc // self.patch_size
-            w_grid = W_proc // self.patch_size
-            self.grid_size = (h_grid, w_grid)
-            n_patches = h_grid * w_grid
-            
-            # ViT output is [B, SeqLen, C]. We take the last n_patches tokens.
-            patch_features = hs.squeeze(0)[-n_patches:, :] # [N, C]
-        else:
-            # ConvNeXt output is [B, C, H_grid, W_grid].
-            # We can read the grid size *directly* from the output.
-            B, C, h_grid, w_grid = hs.shape
-            self.grid_size = (h_grid, w_grid)
-            n_patches = h_grid * w_grid
-            
-            # We just need to flatten it into [N, C].
-            patch_features = hs.flatten(2).permute(0, 2, 1).squeeze(0) # [N, C]
-        
-        # --- 7. Pre-compute the N x N similarity matrix ---
+        # --- START: THE FIX ---
+        # This logic is robust for both ViT and ConvNeXt.
+        # ViT: hs is [B, 1+4+N, C]. We take the last N.
+        # ConvNeXt: hs is [B, N, C]. We take the last N (which is all of them).
+        patch_features = hs.squeeze(0)[-n_patches:, :] # [N, C]
+        # --- END: THE FIX ---
+
+        # --- 6. Pre-compute the N x N similarity matrix ---
         print(f"--- [set_image] DEBUG ---")
+        print(f"Input tensor shape: {img_tensor.shape}")
         print(f"Calculated grid_size: {self.grid_size} (h, w)")
         print(f"Total patches (N): {n_patches}")
+        print(f"Model output hs shape: {hs.shape}")
         print(f"Extracted patch_features shape: {patch_features.shape}")
+        
+        # This check will ensure our logic is correct
+        if patch_features.shape[0] != n_patches:
+            raise RuntimeError(
+                f"Feature extraction failed! Mismatch in patch count. "
+                f"Expected {n_patches} (from {h_grid}x{w_grid}), "
+                f"but model output {hs.shape[1]} tokens, "
+                f"and we extracted {patch_features.shape[0]} features."
+            )
         
         patch_features_norm = F.normalize(patch_features, p=2, dim=1)
         self.similarity_matrix = torch.matmul(patch_features_norm, patch_features_norm.T)
@@ -178,7 +180,7 @@ class DinoSegmenter:
         
         print(f"Got {n_patches} patches ({h_grid}x{w_grid} grid). Computing {n_patches}x{n_patches} matrix...")
         print("Similarity matrix computed and stored.")
-
+        
     def _transform_coords(self, coords: tuple) -> int:
         """Transforms original (y, x) coords to a flat patch_index."""
         y, x = coords
