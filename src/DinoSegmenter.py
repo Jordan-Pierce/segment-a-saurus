@@ -6,7 +6,7 @@ from transformers import AutoImageProcessor, AutoModel
 import torchvision.transforms.v2 as T 
 import matplotlib.pyplot as plt
 import time
-# --- NEW IMPORT ---
+
 from sklearn.linear_model import LogisticRegression
 
 
@@ -17,7 +17,7 @@ class DinoSegmenter:
     """
     
     def __init__(self, 
-                 dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m", 
+                 dino_model_name: str = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m", 
                  device: str = None):
         """
         Initializes the segmenter by loading both DINOv3 and AnyUp models.

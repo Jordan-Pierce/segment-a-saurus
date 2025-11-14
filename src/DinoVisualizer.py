@@ -24,7 +24,7 @@ class DinoVisualizer:
     """
     
     def __init__(self, 
-                 pretrained_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m", 
+                 pretrained_model_name: str = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m", 
                  device: str = None, 
                  max_resolution: int = 1024):
         """
