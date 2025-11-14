@@ -3,26 +3,19 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
-import os
+import torchvision.transforms.v2 as T 
+
 
 class DinoSegmenter:
     """
     An API for visualizing DINOv3 feature similarity,
-    using the exact logic from the provided Gradio app.
-    
-    This class:
-    1. Uses 'facebook/dinov3-vits16-pretrain-lvd1689m' from transformers.
-    2. Correctly extracts patch embeddings using the `hs[-n_patches:, :]` logic.
-    3. Pre-computes the full N x N similarity matrix.
-    4. Uses the simple coordinate-scaling logic for mapping.
+    using the exact logic from the provided Gradio app
+    AND processing the image at high resolution.
     """
     
     def __init__(self, device: str = None):
         """
         Initializes the segmenter by loading the DINOv3 model.
-        
-        Args:
-            device (str, optional): The device to run models on ('cuda', 'cpu').
         """
         print("Initializing DinoSegmenter with DINOv3 (ViT-S/16)...")
         if device:
@@ -33,7 +26,6 @@ class DinoSegmenter:
 
         # 1. Load DINOv3 Model from 'transformers'
         try:
-            # Use the exact model from the new code
             pretrained_model_name = "facebook/dinov3-vits16-pretrain-lvd1689m"
             self.processor = AutoImageProcessor.from_pretrained(pretrained_model_name)
             self.model = AutoModel.from_pretrained(
@@ -54,10 +46,11 @@ class DinoSegmenter:
 
         print(f"DINOv3 ViT-S/16 model loaded. Patch size: {self.patch_size}")
 
+    # --- THIS METHOD IS COMPLETELY REPLACED ---
     @torch.no_grad()
     def set_image(self, image: np.ndarray):
         """
-        Sets and pre-processes the image.
+        Sets and pre-processes the image at HIGH RESOLUTION.
         
         This runs the DINOv3 model ONCE and pre-computes the
         full N x N similarity matrix.
@@ -68,40 +61,59 @@ class DinoSegmenter:
         if not isinstance(image, np.ndarray):
             raise TypeError("Input image must be a numpy array.")
 
-        print("Setting new image and pre-computing similarity matrix...")
+        print("Setting new image (high-res) and pre-computing similarity matrix...")
         img_pil = Image.fromarray(image).convert("RGB")
         self.original_image_size = img_pil.size # (W, H)
         
-        # --- 2. Process image and get features ---
-        # Preprocessing for image include scaling, normalization etc
-        inputs = self.processor(images=img_pil, return_tensors="pt").to(self.device, torch.float16)
-        pixel_values = inputs["pixel_values"]
-        B, C, H_proc, W_proc = pixel_values.shape
+        # --- 1. Get original image size ---
+        W, H = img_pil.size
         
-        # Image of size 224x224, patch size = 16x16, hence image has 14x14 patches
+        # --- 2. Calculate new size that is a multiple of patch_size ---
+        # This is the web demo's exact logic
+        new_H = (H // self.patch_size) * self.patch_size
+        new_W = (W // self.patch_size) * self.patch_size
+        
+        if new_H == 0 or new_W == 0:
+            raise ValueError(
+                f"Image size ({W}x{H}) is smaller than patch size ({self.patch_size})."
+            )
+
+        # --- 3. Create the manual transform ---
+        # We resize/crop to this new, large size, then normalize
+        mean = self.processor.image_mean
+        std = self.processor.image_std
+
+        high_res_transforms = T.Compose([
+            T.ToImage(), # Convert PIL to tensor
+            T.ToDtype(torch.float32, scale=True),
+            # Resize and crop to the *large* multiple of patch_size
+            T.Resize((new_H, new_W), antialias=True), 
+            T.Normalize(mean=mean, std=std),
+        ])
+
+        # --- 4. Apply the transforms ---
+        img_tensor = high_res_transforms(img_pil).to(self.device, torch.float16).unsqueeze(0)
+        
+        B, C, H_proc, W_proc = img_tensor.shape
+        
         h_grid = H_proc // self.patch_size
         w_grid = W_proc // self.patch_size
         self.grid_size = (h_grid, w_grid)
         n_patches = h_grid * w_grid
-        
-        out = self.model(**inputs)
-        
-        # Get the last hidden state
-        hs = out.last_hidden_state.squeeze(0) # [SeqLen, C]
-        
-        # Remove CLS + any non-patch token
+
+        # --- 5. Run the model on the high-res tensor ---
+        out = self.model(pixel_values=img_tensor)
+        hs = out.last_hidden_state.squeeze(0)
         patch_features = hs[-n_patches:, :] # [N, C]
         
-        # --- 3. Pre-compute the N x N similarity matrix ---
+        # --- 6. Pre-compute the N x N similarity matrix ---
         print(f"Got {n_patches} patches ({h_grid}x{w_grid} grid). Computing {n_patches}x{n_patches} matrix...")
         
-        # Flatten and normalize
         patch_features_norm = F.normalize(patch_features, p=2, dim=1)
-        
-        # (N, C) @ (C, N) -> (N, N)
         self.similarity_matrix = torch.matmul(patch_features_norm, patch_features_norm.T)
         
         print("Similarity matrix computed and stored.")
+
 
     def _transform_coords(self, coords: tuple) -> int:
         """Transforms original (y, x) coords to a flat patch_index."""
@@ -110,7 +122,6 @@ class DinoSegmenter:
         h_grid, w_grid = self.grid_size
         
         # Map click coordinates to original patch grid
-        # (y_click / overlay_H * rows)
         y_grid = int((y / H_orig) * h_grid)
         x_grid = int((x / W_orig) * w_grid)
         
@@ -118,7 +129,6 @@ class DinoSegmenter:
         y_clamped = max(0, min(y_grid, h_grid - 1))
         x_clamped = max(0, min(x_grid, w_grid - 1))
             
-        # Convert to flat index
         patch_index = y_clamped * w_grid + x_clamped
         return patch_index
 
@@ -141,7 +151,6 @@ class DinoSegmenter:
         min_val = torch.min(scores)
         max_val = torch.max(scores)
         
-        # Add epsilon for stability
         if min_val == max_val:
             normalized_scores = torch.ones_like(scores)
         else:
@@ -154,6 +163,7 @@ class DinoSegmenter:
 
 if __name__ == "__main__":
     
+    import time
     import matplotlib.pyplot as plt
 
     # 1. Load a sample image
@@ -248,9 +258,7 @@ if __name__ == "__main__":
         input("Press Enter to finish...")
         undo_time = time.time() - start_time
         print(f"Undo test completed in {undo_time:.2f} seconds.")
-
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to download image: {e}")
+        
     except Exception as e:
         print(f"An error occurred during the demo: {e}")
         import traceback

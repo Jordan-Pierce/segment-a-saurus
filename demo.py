@@ -3,6 +3,8 @@ import sys
 import argparse
 import cv2
 import numpy as np
+import os
+import glob
 
 from dino_segmenter import DinoSegmenter
 
@@ -13,13 +15,41 @@ class InteractiveVisualizerApp:
     replicating the original web demo.
     """
     
-    def __init__(self, image_path: str):
-        self.window_name = "DINOv3 Similarity (Move mouse to explore, 'q' to quit)"
+    def __init__(self, folder_path: str):
+        self.window_name = "DINOv3 Similarity"
         
-        # 1. Load the image
-        self.image_bgr = cv2.imread(image_path)
+        # 1. Get all images in the folder
+        self.images = sorted(
+            glob.glob(os.path.join(folder_path, "*.jpg")) +
+            glob.glob(os.path.join(folder_path, "*.png"))
+        )
+        if not self.images:
+            raise ValueError(f"No .jpg or .png images found in {folder_path}")
+        
+        self.current_index = 0
+        self.load_image(self.current_index)
+        
+        # 2. Initialize the segmenter
+        try:
+            self.segmenter = DinoSegmenter()
+        except Exception as e:
+            print(f"Fatal error: Could not initialize DinoSegmenter.")
+            print(f"Error details: {e}")
+            sys.exit(1)
+            
+        # 3. Run the "slow" setup step
+        print("Setting image... (This may take a moment on first run)")
+        self.segmenter.set_image(self.image_rgb)
+        print("Image set. Ready for interaction.")
+
+    def load_image(self, index):
+        """Loads the image at the given index."""
+        self.image_path = self.images[index]
+        
+        # Load the image
+        self.image_bgr = cv2.imread(self.image_path)
         if self.image_bgr is None:
-            raise FileNotFoundError(f"Could not load image from {image_path}")
+            raise FileNotFoundError(f"Could not load image from {self.image_path}")
             
         # Store original size
         self.original_h, self.original_w = self.image_bgr.shape[:2]
@@ -33,19 +63,12 @@ class InteractiveVisualizerApp:
         # Initialize state
         self.display_image = self.image_bgr.copy()
         
-        # 2. Initialize the segmenter
-        try:
-            # This uses the new DSegmenter from our last step
-            self.segmenter = DinoSegmenter()
-        except Exception as e:
-            print(f"Fatal error: Could not initialize DinoSegmenter.")
-            print(f"Error details: {e}")
-            sys.exit(1)
-            
-        # 3. Run the "slow" setup step
-        print("Setting image... (This may take a moment on first run)")
-        self.segmenter.set_image(self.image_rgb)
-        print("Image set. Ready for interaction.")
+        # Update window title
+        title = (
+            f"DINOv3 Similarity - {os.path.basename(self.image_path)} "
+            "(Move mouse to explore, arrows to cycle, 'q' to quit)"
+        )
+        cv2.setWindowTitle(self.window_name, title)
 
     def _create_overlay(self, low_res_map: np.ndarray):
         """
@@ -100,10 +123,6 @@ class InteractiveVisualizerApp:
                 self._refresh(low_res_map=low_res_similarity_map)
             except Exception as e:
                 print(f" Error during similarity lookup: {e}")
-                
-        # On mouse leave, reset the image
-        elif event == cv2.EVENT_MOUSELEAVE:
-            self._refresh(low_res_map=None)
 
     def run(self):
         """Starts the main application loop."""
@@ -116,16 +135,31 @@ class InteractiveVisualizerApp:
         
         print("\n--- Controls ---")
         print("Move mouse:   Show similarity")
-        print("Mouse leaves: Clear highlights")
+        print("Left arrow:   Previous image")
+        print("Right arrow:  Next image")
         print("q:            Quit")
         print("----------------\n")
         
         while True:
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(1)
             
             # Quit
             if key == ord('q'):
                 break
+                
+            # Left arrow
+            elif key == 2424832:
+                self.current_index = (self.current_index - 1) % len(self.images)
+                self.load_image(self.current_index)
+                self.segmenter.set_image(self.image_rgb)
+                self._refresh()
+                
+            # Right arrow
+            elif key == 2555904:
+                self.current_index = (self.current_index + 1) % len(self.images)
+                self.load_image(self.current_index)
+                self.segmenter.set_image(self.image_rgb)
+                self._refresh()
                 
         cv2.destroyAllWindows()
         
@@ -136,15 +170,17 @@ if __name__ == "__main__":
         description="Interactive DINOv2 Segmentation Tool"
     )
     parser.add_argument(
-        "-i", "--image", 
-        default="data/veggies.jpg",
-        help="Path to the input image file."
+        "-f", "--folder", 
+        default="data/",
+        help="Path to the folder containing images."
     )
     args = parser.parse_args()
     
     try:
-        app = InteractiveVisualizerApp(args.image)
+        app = InteractiveVisualizerApp(args.folder)
         app.run()
+    except ValueError as e:
+        print(f"Error: {e}")
     except FileNotFoundError as e:
         print(f"Error: {e}")
     except Exception as e:
