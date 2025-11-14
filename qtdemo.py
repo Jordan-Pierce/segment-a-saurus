@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLay
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtCore import Qt
 
-from dino_segmenter import DinoSegmenter
+from src import DinoVisualizer
 
 
 class ImageLabel(QLabel):
@@ -27,7 +27,7 @@ class ImageLabel(QLabel):
 
 class InteractiveVisualizerApp(QWidget):
     """
-    Wraps the DinoSegmenter to visualize DINOv3 feature similarity using PyQt5 and QPixmap.
+    Wraps the DinoVisualizer to visualize DINOv3 feature similarity using PyQt5 and QPixmap.
     """
 
     def __init__(self, folder_path: str, max_res: int = 1024):
@@ -44,16 +44,16 @@ class InteractiveVisualizerApp(QWidget):
         self.current_index = 0
         self.load_image(self.current_index)
 
-        # 2. Initialize the segmenter
+        # 2. Initialize the visualizer
         try:
-            self.segmenter = DinoSegmenter(max_resolution=max_res)
+            self.visualizer = DinoVisualizer(max_resolution=max_res)
         except Exception as e:
-            print(f"Fatal error: Could not initialize DinoSegmenter. Error: {e}")
+            print(f"Fatal error: Could not initialize DinoVisualizer. Error: {e}")
             sys.exit(1)
 
         # 3. Run the "slow" setup step
         print("Setting image... (This may take a moment on first run)")
-        self.segmenter.set_image(self.image_rgb)
+        self.visualizer.set_image(self.image_rgb)
         print("Image set. Ready for interaction.")
 
         # Set up UI
@@ -151,7 +151,7 @@ class InteractiveVisualizerApp(QWidget):
         x = max(0, min(x, self.original_w - 1))
 
         try:
-            low_res_similarity_map = self.segmenter.get_similarity_map(
+            low_res_similarity_map = self.visualizer.get_similarity_map(
                 original_coords=(y, x)
             ).astype(np.float32)
             self.update_display(low_res_map=low_res_similarity_map)
@@ -161,13 +161,13 @@ class InteractiveVisualizerApp(QWidget):
     def prev_image(self):
         self.current_index = (self.current_index - 1) % len(self.images)
         self.load_image(self.current_index)
-        self.segmenter.set_image(self.image_rgb)
+        self.visualizer.set_image(self.image_rgb)
         self.update_display()
 
     def next_image(self):
         self.current_index = (self.current_index + 1) % len(self.images)
         self.load_image(self.current_index)
-        self.segmenter.set_image(self.image_rgb)
+        self.visualizer.set_image(self.image_rgb)
         self.update_display()
 
     def keyPressEvent(self, event):

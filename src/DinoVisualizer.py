@@ -16,7 +16,7 @@ pretrained_model_names = [
 ]
             
 
-class DinoSegmenter:
+class DinoVisualizer:
     """
     An API for visualizing DINOv3 feature similarity,
     using the exact logic from the provided Gradio app
@@ -28,14 +28,14 @@ class DinoSegmenter:
                  device: str = None, 
                  max_resolution: int = 1024):
         """
-        Initializes the segmenter by loading the DINOv3 model.
+        Initializes the visualizer by loading the DINOv3 model.
         
         Args:
             pretrained_model_name (str): The full model name from Hugging Face.
             device (str, optional): The device to run models on ('cuda', 'cpu').
             max_resolution (int): The maximum dimension (W or H) to process.
         """
-        print(f"Initializing DinoSegmenter with {pretrained_model_name}...")
+        print(f"Initializing DinoVisualizer with {pretrained_model_name}...")
         if device:
             self.device = torch.device(device)
         else:
@@ -230,106 +230,3 @@ class DinoSegmenter:
         print("--- [get_similarity_map] DEBUG END ---")
         
         return normalized_scores.reshape(h, w).cpu().numpy()
-
-if __name__ == "__main__":
-    
-    import time
-    import matplotlib.pyplot as plt
-
-    # 1. Load a sample image
-    print("Starting to load sample image...")
-    start_time = time.time()
-    path = "test_images/veggies.jpg"
-    try:
-        image = Image.open(path).convert("RGB")
-        image_np = np.array(image)
-        
-        print(f"Loaded image with shape: {image_np.shape}")
-        download_time = time.time() - start_time
-        print(f"Image download and loading completed in {download_time:.2f} seconds.")
-
-        # 2. Initialize segmenter
-        print("Starting to initialize DinoSegmenter...")
-        start_time = time.time()
-        # This is slow the first time as it downloads models
-        segmenter = DinoSegmenter()
-        init_time = time.time() - start_time
-        print(f"DinoSegmenter initialization completed in {init_time:.2f} seconds.")
-
-        # 3. Set the image (this is the main computation step)
-        print("Starting to set the image and process features...")
-        start_time = time.time()
-        segmenter.set_image(image_np)
-        set_image_time = time.time() - start_time
-        print(f"Image setting and feature processing completed in {set_image_time:.2f} seconds.")
-
-        # 4. Add prompts (coordinates are for the original image)
-        print("Starting to add prompts...")
-        start_time = time.time()
-        # Positive point on the green broccoli
-        segmenter.add_prompt(prompt_type='point', coords=[450, 400], is_positive=True)
-        # Positive point on the orange carrot
-        segmenter.add_prompt(prompt_type='point', coords=[600, 700], is_positive=True)
-        
-        # Negative point on the dark background
-        segmenter.add_prompt(prompt_type='point', coords=[50, 50], is_positive=False)
-        # Negative box on the bright white background
-        segmenter.add_prompt(prompt_type='box', coords=[0, 1000, 200, 1280], is_positive=False)
-        add_prompts_time = time.time() - start_time
-        print(f"Adding prompts completed in {add_prompts_time:.2f} seconds.")
-
-        # 5. Predict the mask
-        print("Starting mask prediction...")
-        start_time = time.time()
-        # We use a threshold of 0.6 (since 0.5 is the new "neutral" point)
-        mask = segmenter.predict_mask(threshold=0.6)
-        predict_time = time.time() - start_time
-        print(f"Mask prediction completed in {predict_time:.2f} seconds.")
-
-        # 6. Plot results
-        print("Starting to plot results...")
-        start_time = time.time()
-        fig, axs = plt.subplots(1, 3, figsize=(20, 7))
-        
-        axs[0].imshow(image_np)
-        axs[0].set_title("Original Image")
-        axs[0].axis("off")
-
-        axs[1].imshow(mask, cmap='gray')
-        axs[1].set_title("Predicted Mask")
-        axs[1].axis("off")
-
-        # Create an overlay
-        overlay = image_np.copy()
-        overlay[mask] = [255, 0, 0] # Highlight mask in red
-        
-        axs[2].imshow(image_np)
-        axs[2].imshow(overlay, alpha=0.5)
-        axs[2].set_title("Mask Overlay")
-        axs[2].axis("off")
-
-        plt.tight_layout()
-        plt.show()
-        input("Press Enter to continue to the undo test...")
-        plot_time = time.time() - start_time
-        print(f"Plotting results completed in {plot_time:.2f} seconds.")
-        
-        # --- 7. Test undo ---
-        print("Starting undo test...")
-        start_time = time.time()
-        segmenter.undo_prompt()  # Removes the negative box
-        mask_undone = segmenter.predict_mask(threshold=0.6)
-        
-        plt.figure(figsize=(7, 7))
-        plt.imshow(mask_undone, cmap='gray')
-        plt.title("Mask after 'undo' (negative box removed)")
-        plt.axis("off")
-        plt.show()
-        input("Press Enter to finish...")
-        undo_time = time.time() - start_time
-        print(f"Undo test completed in {undo_time:.2f} seconds.")
-        
-    except Exception as e:
-        print(f"An error occurred during the demo: {e}")
-        import traceback
-        traceback.print_exc()
