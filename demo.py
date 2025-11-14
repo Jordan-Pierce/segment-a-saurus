@@ -85,7 +85,7 @@ class InteractiveVisualizerApp:
         )
         
         # Create a yellow highlight color (or any color you prefer)
-        highlight_color = np.array([0, 255, 255], dtype=np.uint8) # BGR
+        highlight_color = np.array([255, 255, 255], dtype=np.uint8)  # BGR
         
         # Scale confidence map (0.0-1.0) to a 3-channel BGR mask
         highlight_mask = confidence_map[..., None] * highlight_color
