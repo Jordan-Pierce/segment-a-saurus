@@ -34,7 +34,16 @@ class DinoSegmenter:
 
         # 1. Load DINOv3 Model from 'transformers'
         try:
+            models_options = ["facebook/dinov2-small", 
+                              "facebook/dinov2-base",
+                              "facebook/dinov2-large",
+                              "facebook/dinov2-giant",
+                              "facebook/dinov3-vits16-pretrain-lvd1689m"]
+
+            pretrained_model_name = "facebook/dinov3-vit7b16-pretrain-lvd1689m"
             pretrained_model_name = "facebook/dinov3-vits16-pretrain-lvd1689m"
+            pretrained_model_name = "facebook/dinov3-vits16plus-pretrain-lvd1689m"
+            
             self.processor = AutoImageProcessor.from_pretrained(pretrained_model_name)
             self.model = AutoModel.from_pretrained(
                 pretrained_model_name,
