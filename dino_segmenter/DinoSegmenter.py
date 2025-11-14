@@ -6,6 +6,17 @@ from transformers import AutoImageProcessor, AutoModel
 import torchvision.transforms.v2 as T 
 
 
+pretrained_model_names = [
+    "facebook/dinov2-small",
+    "facebook/dinov2-base",
+    "facebook/dinov2-large",
+    "facebook/dinov2-giant",
+    "facebook/dinov3-vits16plus-pretrain-lvd1689m"
+    "facebook/dinov3-vits16-pretrain-lvd1689m",
+    "facebook/dinov3-vit7b16-pretrain-lvd1689m",
+]
+            
+
 class DinoSegmenter:
     """
     An API for visualizing DINOv3 feature similarity,
@@ -13,17 +24,19 @@ class DinoSegmenter:
     AND processing the image at a user-defined max resolution.
     """
     
-    def __init__(self, device: str = None, max_resolution: int = 1024):
+    def __init__(self, 
+                 pretrained_model_name: str = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m", 
+                 device: str = None, 
+                 max_resolution: int = 1024):
         """
         Initializes the segmenter by loading the DINOv3 model.
         
         Args:
+            pretrained_model_name (str): The full model name from Hugging Face.
             device (str, optional): The device to run models on ('cuda', 'cpu').
             max_resolution (int): The maximum dimension (W or H) to process.
-                                  Images larger than this will be scaled down
-                                  before feature extraction to save memory/time.
         """
-        print("Initializing DinoSegmenter with DINOv3 (ViT-S/16)...")
+        print(f"Initializing DinoSegmenter with {pretrained_model_name}...")
         if device:
             self.device = torch.device(device)
         else:
@@ -31,39 +44,46 @@ class DinoSegmenter:
         print(f"Using device: {self.device}")
         
         self.max_resolution = max_resolution
+                
+        # Determine model type *before* loading
+        self.is_vit = "vit" in pretrained_model_name.lower()
+        
+        # Set attention implementation based on model type
+        # ConvNeXt models crash with "sdpa", so we use "eager" as the error suggests.
+        if self.is_vit:
+            attn_impl = "sdpa"
+        else:
+            attn_impl = "eager"
 
         # 1. Load DINOv3 Model from 'transformers'
         try:
-            pretrained_model_names = [
-                "facebook/dinov2-small",
-                "facebook/dinov2-base",
-                "facebook/dinov2-large",
-                "facebook/dinov2-giant",
-                "facebook/dinov3-vits16plus-pretrain-lvd1689m"
-                "facebook/dinov3-vits16-pretrain-lvd1689m",
-                "facebook/dinov3-vit7b16-pretrain-lvd1689m",
-            ]
-            # Use the default model for now
-            pretrained_model_name = "facebook/dinov3-vits16plus-pretrain-lvd1689m"
-            
+            print(f"Loading {pretrained_model_name} with attn_implementation='{attn_impl}'...")
             self.processor = AutoImageProcessor.from_pretrained(pretrained_model_name)
             self.model = AutoModel.from_pretrained(
                 pretrained_model_name,
                 torch_dtype=torch.float16,
                 device_map="auto",
-                attn_implementation="sdpa",
+                attn_implementation=attn_impl, # Use the conditional variable
             ).to(self.device).eval()
-            self.patch_size = self.model.config.patch_size
+            
+            # Set patch size based on model type
+            if self.is_vit:
+                self.patch_size = self.model.config.patch_size
+            else:
+                # ConvNeXt models have a "patch size" equivalent to
+                # their total downsampling stride, which is 32.
+                self.patch_size = 32 
+
         except Exception as e:
             print(f"Error loading DINOv3 model from transformers: {e}")
             raise
-
+            
         # 4. Initialize state
         self.original_image_size = None # (W, H)
         self.grid_size = None # (h, w)
         self.similarity_matrix = None # This will be our [N, N] matrix
 
-        print(f"DINOv3 ViT-S/16 model loaded. Patch size: {self.patch_size}")
+        print(f"Model loaded. Is ViT: {self.is_vit}, Patch Size: {self.patch_size}")
 
     @torch.no_grad()
     def set_image(self, image: np.ndarray):
@@ -83,10 +103,8 @@ class DinoSegmenter:
         img_pil = Image.fromarray(image).convert("RGB")
         self.original_image_size = img_pil.size # (W, H)
         
-        # --- 1. Get original image size ---
+        # --- 1. Get original image size & scale ---
         W, H = img_pil.size
-        
-        # --- 2. NEW: Scale down if larger than max_resolution ---
         scale_factor = 1.0
         if max(W, H) > self.max_resolution:
             scale_factor = self.max_resolution / max(W, H)
@@ -94,7 +112,7 @@ class DinoSegmenter:
         target_H = int(H * scale_factor)
         target_W = int(W * scale_factor)
 
-        # --- 3. Calculate new size that is a multiple of patch_size ---
+        # --- 2. Calculate new size that is a multiple of patch_size ---
         new_H = (target_H // self.patch_size) * self.patch_size
         new_W = (target_W // self.patch_size) * self.patch_size
         
@@ -104,39 +122,61 @@ class DinoSegmenter:
                 f"({self.patch_size}). Try a larger max_resolution."
             )
 
-        # --- 4. Create the manual transform ---
+        # --- 3. Create the manual transform ---
         mean = self.processor.image_mean
         std = self.processor.image_std
-
         high_res_transforms = T.Compose([
-            T.ToImage(), # Convert PIL to tensor
+            T.ToImage(),
             T.ToDtype(torch.float32, scale=True),
-            # Resize and crop to the *scaled* multiple of patch_size
             T.Resize((new_H, new_W), antialias=True), 
             T.Normalize(mean=mean, std=std),
         ])
 
-        # --- 5. Apply the transforms ---
+        # --- 4. Apply the transforms ---
         img_tensor = high_res_transforms(img_pil).to(self.device, torch.float16).unsqueeze(0)
         
-        B, C, H_proc, W_proc = img_tensor.shape
-        
-        h_grid = H_proc // self.patch_size
-        w_grid = W_proc // self.patch_size
-        self.grid_size = (h_grid, w_grid)
-        n_patches = h_grid * w_grid
-
-        # --- 6. Run the model on the high-res tensor ---
+        # --- 5. Run the model on the high-res tensor ---
         out = self.model(pixel_values=img_tensor)
-        hs = out.last_hidden_state.squeeze(0)
-        patch_features = hs[-n_patches:, :] # [N, C]
+        hs = out.last_hidden_state
+        
+        # --- 6. START: THE FIX ---
+        # Get the *actual* grid size and patch features from the output
+        
+        if self.is_vit:
+            # ViT output is [B, SeqLen, C].
+            # We must calculate n_patches based on the *input tensor shape*
+            # and then grab the tokens.
+            B, C, H_proc, W_proc = img_tensor.shape
+            h_grid = H_proc // self.patch_size
+            w_grid = W_proc // self.patch_size
+            self.grid_size = (h_grid, w_grid)
+            n_patches = h_grid * w_grid
+            
+            # ViT output is [B, SeqLen, C]. We take the last n_patches tokens.
+            patch_features = hs.squeeze(0)[-n_patches:, :] # [N, C]
+        else:
+            # ConvNeXt output is [B, C, H_grid, W_grid].
+            # We can read the grid size *directly* from the output.
+            B, C, h_grid, w_grid = hs.shape
+            self.grid_size = (h_grid, w_grid)
+            n_patches = h_grid * w_grid
+            
+            # We just need to flatten it into [N, C].
+            patch_features = hs.flatten(2).permute(0, 2, 1).squeeze(0) # [N, C]
         
         # --- 7. Pre-compute the N x N similarity matrix ---
-        print(f"Got {n_patches} patches ({h_grid}x{w_grid} grid). Computing {n_patches}x{n_patches} matrix...")
+        print(f"--- [set_image] DEBUG ---")
+        print(f"Calculated grid_size: {self.grid_size} (h, w)")
+        print(f"Total patches (N): {n_patches}")
+        print(f"Extracted patch_features shape: {patch_features.shape}")
         
         patch_features_norm = F.normalize(patch_features, p=2, dim=1)
         self.similarity_matrix = torch.matmul(patch_features_norm, patch_features_norm.T)
         
+        print(f"Similarity matrix shape: {self.similarity_matrix.shape}")
+        print("--- [set_image] DEBUG END ---")
+        
+        print(f"Got {n_patches} patches ({h_grid}x{w_grid} grid). Computing {n_patches}x{n_patches} matrix...")
         print("Similarity matrix computed and stored.")
 
     def _transform_coords(self, coords: tuple) -> int:
@@ -182,8 +222,16 @@ class DinoSegmenter:
             
         # 4. Reshape to grid
         h, w = self.grid_size
-        return normalized_scores.reshape(h, w).cpu().numpy()
         
+        # --- ADDED PRINT STATEMENTS ---
+        print(f"--- [get_similarity_map] DEBUG ---")
+        print(f"Target grid_size: {(h, w)}")
+        print(f"normalized_scores shape (N): {normalized_scores.shape}")
+        print(f"Target shape elements: {h * w}")
+        print(f"Input elements: {normalized_scores.numel()}")
+        print("--- [get_similarity_map] DEBUG END ---")
+        
+        return normalized_scores.reshape(h, w).cpu().numpy()
 
 if __name__ == "__main__":
     
