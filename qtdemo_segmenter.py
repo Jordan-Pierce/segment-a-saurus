@@ -63,7 +63,7 @@ class InteractiveSegmenterApp(QWidget):
         print("Image set. Ready for interaction.")
 
         # Initialize prompts and threshold
-        self.threshold = 0.5
+        self.threshold = 0.90
         self.app_prompts = []
 
         # Set up UI
@@ -264,7 +264,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resolution",
         type=int,
-        default=448,
+        default=1024,
         help="Max resolution (in pixels) to process the image at. Smaller is faster."
     )
     args = parser.parse_args()

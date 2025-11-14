@@ -133,8 +133,8 @@ class DinoSegmenter:
         
         # Store info needed to map clicks from original image to processed image
         scale_factor = target_res / min(W_orig, H_orig)
-        new_W = int(W_orig * scale_factor)
-        new_H = int(H_orig * scale_factor)
+        new_W = int(round(W_orig * scale_factor))  
+        new_H = int(round(H_orig * scale_factor)) 
         
         self.transform_info = {
             "original_size": (W_orig, H_orig),
@@ -314,8 +314,8 @@ class DinoSegmenter:
         scale = info["resize_scale"]
         
         # 3. Calculate the "resized-but-not-cropped" dimensions
-        new_H = int(H_orig * scale)
-        new_W = int(W_orig * scale)
+        new_H = int(round(H_orig * scale)) # Use round() to match torchvision
+        new_W = int(round(W_orig * scale)) # Use round() to match torchvision
         
         # 4. Create a blank canvas with these dimensions
         uncropped_mask = np.zeros((new_H, new_W), dtype=np.uint8)
