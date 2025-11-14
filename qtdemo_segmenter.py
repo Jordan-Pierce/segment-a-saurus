@@ -150,15 +150,10 @@ class InteractiveSegmenterApp(QWidget):
         if self.segmenter.prompts:
             try:
                 confidence_map = self.segmenter.predict_mask()
-                binary_mask = (confidence_map > self.threshold).astype(np.uint8)
-                # Resize mask to original size
-                mask_resized = cv2.resize(
-                    binary_mask, (self.original_w, self.original_h),
-                    interpolation=cv2.INTER_NEAREST
-                )
+                final_mask = self.segmenter.post_process_mask(confidence_map, threshold=self.threshold)
                 # Overlay
-                highlight_color = np.array([0, 255, 0], dtype=np.uint8)  # Green overlay
-                highlight_mask = mask_resized[..., None] * highlight_color
+                highlight_color = np.array([255, 255, 255], dtype=np.uint8)  # White overlay
+                highlight_mask = final_mask[..., None] * highlight_color
                 self.display_image = cv2.add(self.display_image, highlight_mask.astype(np.uint8))
             except Exception as e:
                 print(f"Error during mask prediction: {e}")

@@ -351,7 +351,7 @@ if __name__ == "__main__":
     
     TEST_IMAGE_PATH = "data/veggies.jpg" 
     PROCESSING_RESOLUTION = 448
-    DINOV3_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"  # Patch size 16
+    DINOV3_MODEL = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m"  # Patch size 16
     
     point = (110, 310)  # y, x coordinate of a hanging tomato
         
