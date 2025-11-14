@@ -300,17 +300,7 @@ class DinoSegmenter:
     def post_process_mask(self, confidence_map: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
         Aligns the processed confidence map with the original image.
-        
-        Takes the small, square confidence_map, applies a threshold,
-        pastes it into the center of a resized canvas, and then
-        resizes it back to the original image's dimensions.
-        
-        Args:
-            confidence_map (np.ndarray): The [H_proc, W_proc] map from predict_mask().
-            threshold (float): The cutoff to create the binary mask.
-            
-        Returns:
-            np.ndarray: A [H_orig, W_orig] boolean mask.
+        ...
         """
         if self.transform_info is None:
             raise RuntimeError("set_image() must be called before post-processing.")
@@ -332,10 +322,20 @@ class DinoSegmenter:
         
         # 5. Paste the binary_mask into the center
         top, left = info["crop_top"], info["crop_left"]
-        H_proc, W_proc = info["processed_size"]
         
+        # --- THIS IS THE FIX ---
+        # Instead of getting H_proc/W_proc from info,
+        # get the *actual* shape of the mask you are pasting.
         mask_to_paste = (binary_mask * 255).astype(np.uint8)
-        uncropped_mask[top : top + H_proc, left : left + W_proc] = mask_to_paste
+        H_mask, W_mask = mask_to_paste.shape
+        
+        # Make sure the paste doesn't go out of bounds
+        # (This handles rounding errors)
+        H_end = min(top + H_mask, new_H)
+        W_end = min(left + W_mask, new_W)
+        
+        uncropped_mask[top : H_end, left : W_end] = mask_to_paste[0 : H_end - top, 0 : W_end - left]
+        # --- END FIX ---
         
         # 6. Resize this correctly aligned mask to the *original* image size
         mask_img = Image.fromarray(uncropped_mask)
