@@ -9,7 +9,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/qtdemo.py",
-            "args": ["--resolution", "2048"],
+            "args": ["--resolution", "1024"],
             "console": "integratedTerminal"
         }
     ]

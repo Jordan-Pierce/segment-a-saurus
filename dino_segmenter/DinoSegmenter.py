@@ -7,10 +7,6 @@ import torchvision.transforms.v2 as T
 
 
 pretrained_model_names = [
-    "facebook/dinov2-small",
-    "facebook/dinov2-base",
-    "facebook/dinov2-large",
-    "facebook/dinov2-giant",
     
     "facebook/dinov3-vits16plus-pretrain-lvd1689m"
     "facebook/dinov3-vits16-pretrain-lvd1689m",
