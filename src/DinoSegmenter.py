@@ -208,7 +208,7 @@ if __name__ == "__main__":
     
     # Resolution to process at. Must be a multiple of 16 (for vits16) or 32 (for convnext)
     # Use a smaller value (e.g., 448 or 512) for faster testing
-    PROCESSING_RESOLUTION = 1024 
+    PROCESSING_RESOLUTION = 448 
     
     # Model to test
     # DINOV3_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m" # Patch size 16
