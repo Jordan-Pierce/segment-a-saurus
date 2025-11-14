@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DINOv3 Web</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <style>
+      body {
+        font-family:
+          "Inter",
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          Roboto,
+          Helvetica,
+          Arial,
+          sans-serif;
+      }
+      /* Custom styles for the range slider */
+      input[type="range"] {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 100%;
+        height: 0.5rem;
+        background: #4a5568; /* gray-700 */
+        border-radius: 0.25rem;
+        outline: none;
+        opacity: 0.7;
+        transition: opacity 0.2s;
+      }
+      input[type="range"]:hover {
+        opacity: 1;
+      }
+      input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 1.25rem;
+        height: 1.25rem;
+        background: #90cdf4; /* blue-300 */
+        cursor: pointer;
+        border-radius: 50%;
+      }
+      input[type="range"]::-moz-range-thumb {
+        width: 1.25rem;
+        height: 1.25rem;
+        background: #90cdf4; /* blue-300 */
+        cursor: pointer;
+        border-radius: 50%;
+      }
+      /* Additional styles for the toggle switch */
+      #modeToggle:checked ~ .dot {
+        transform: translateX(1.5rem); /* 24px */
+      }
+      #modeToggle:checked ~ .block {
+        background-color: #3b82f6; /* blue-500 */
+      }
+    </style>
+  </head>
+  <body class="bg-gray-900 text-gray-300 flex flex-col items-center justify-center min-h-screen p-4 sm:p-6 lg:p-8">
+    <div
+      class="w-full max-w-3xl bg-gray-800/50 backdrop-blur-sm rounded-2xl shadow-2xl shadow-black/30 border border-gray-700 p-6 sm:p-8 text-center"
+    >
+      <h1
+        class="text-3xl sm:text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-500 mb-2"
+      >
+        DINOv3 Web
+      </h1>
+      <p class="text-gray-400 mb-8 max-w-xl mx-auto">
+        Visualize rich, dense image features 100% locally in your browser.
+      </p>
+
+      <div class="space-y-6">
+        <div
+          id="dropZone"
+          class="relative flex flex-col items-center justify-center bg-gray-900/50 border-2 border-dashed border-gray-600 rounded-xl p-6 text-center group hover:border-blue-500 transition-colors duration-300"
+        >
+          <svg
+            class="w-12 h-12 mb-4 text-gray-500 group-hover:text-blue-500 transition-colors duration-300"
+            aria-hidden="true"
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 20 16"
+          >
+            <path
+              stroke="currentColor"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="1.5"
+              d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2"
+            />
+          </svg>
+          <p class="font-semibold text-gray-300">Click to upload or drag & drop</p>
+          <p class="text-xs text-gray-500 mb-2">PNG, JPG, or other image formats</p>
+          <p class="text-sm text-gray-400">
+            Or
+            <button
+              id="exampleBtn"
+              class="relative z-10 text-blue-400 hover:text-blue-300 font-semibold underline bg-transparent border-none cursor-pointer p-0"
+            >
+              try an example</button
+            >.
+          </p>
+          <label for="imageLoader" class="absolute inset-0 cursor-pointer z-0"></label>
+          <input type="file" id="imageLoader" accept="image/*" class="hidden" />
+        </div>
+
+        <div class="bg-gray-900/50 p-4 rounded-xl border border-gray-700 space-y-4">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 items-center">
+            <div class="flex items-center justify-center w-full space-x-3">
+              <label for="scaleSlider" class="text-sm font-medium text-gray-400 whitespace-nowrap">Scale:</label>
+              <input id="scaleSlider" type="range" min="0.25" max="4" step="0.25" value="1" class="w-full" />
+              <span id="scaleValue" class="text-sm font-medium text-gray-400 w-12 text-right">1.00x</span>
+            </div>
+            <div class="flex items-center justify-center space-x-3">
+              <span class="text-sm font-medium text-gray-400">Overlay</span>
+              <label for="modeToggle" class="flex items-center cursor-pointer">
+                <div class="relative">
+                  <input type="checkbox" id="modeToggle" class="sr-only" />
+                  <div class="block bg-gray-600 w-14 h-8 rounded-full"></div>
+                  <div class="dot absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition transform"></div>
+                </div>
+              </label>
+              <span class="text-sm font-medium text-gray-400">Heatmap</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="status" class="flex items-center justify-center w-full font-medium text-gray-400 h-6">
+          <svg
+            id="spinner"
+            class="animate-spin mr-3 h-5 w-5 text-blue-400 hidden"
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 24 24"
+          >
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path
+              class="opacity-75"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+            ></path>
+          </svg>
+          <span id="statusText"></span>
+        </div>
+
+        <div
+          id="canvasContainer"
+          class="w-full bg-gray-900/50 rounded-lg border border-gray-700 shadow-inner overflow-hidden min-h-[250px] flex items-center justify-center p-2"
+        >
+          <canvas id="imageCanvas" class="hidden rounded-lg cursor-crosshair block max-w-full h-auto"></canvas>
+          <div id="canvasPlaceholder" class="text-gray-500">Your image will appear here</div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module">
+      import { pipeline, RawImage, matmul } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
+
+      // --- 1. Configuration & Global Variables ---
+      const MODEL_ID = "onnx-community/dinov3-vits16-pretrain-lvd1689m-ONNX";
+      const EXAMPLE_IMAGE_URL =
+        "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.png";
+
+      // DOM Elements
+      const imageLoader = document.getElementById("imageLoader");
+      const exampleBtn = document.getElementById("exampleBtn");
+      const imageCanvas = document.getElementById("imageCanvas");
+      const ctx = imageCanvas.getContext("2d");
+      const spinner = document.getElementById("spinner");
+      const statusText = document.getElementById("statusText");
+      const canvasContainer = document.getElementById("canvasContainer");
+      const canvasPlaceholder = document.getElementById("canvasPlaceholder");
+      const dropZone = document.getElementById("dropZone");
+      const modeToggle = document.getElementById("modeToggle");
+      const scaleSlider = document.getElementById("scaleSlider");
+      const scaleValue = document.getElementById("scaleValue");
+
+      // Application State
+      let extractor = null;
+      let similarityScores = null;
+      let originalImage = null;
+      let currentImageUrl = null;
+      let patchSize = null;
+      let isOverlayMode = true;
+      let lastHoverData = null;
+      let imageScale = 1.0;
+      let animationFrameId = null;
+      let lastMouseEvent = null;
+      let maxPixels = null;
+
+      // --- 2. Core Application Logic ---
+      function updateStatus(text, isLoading = false) {
+        statusText.textContent = text;
+        spinner.style.display = isLoading ? "block" : "none";
+      }
+
+      async function initialize() {
+        const isWebGpuSupported = !!navigator.gpu;
+        const isMobile = /Mobi|Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+          navigator.userAgent,
+        );
+        maxPixels = isMobile ? 1048576 : 2097152;
+
+        const device = isWebGpuSupported ? "webgpu" : "wasm";
+        const dtype = isWebGpuSupported ? "q4" : "q8";
+
+        let statusMessage = `Loading model (${device.toUpperCase()})`;
+        if (isMobile) statusMessage += ". Mobile Detected.";
+        updateStatus(statusMessage, true);
+
+        try {
+          extractor = await pipeline("image-feature-extraction", MODEL_ID, {
+            device,
+            dtype,
+          });
+          extractor.processor.image_processor.do_resize = false;
+          patchSize = extractor.model.config.patch_size;
+          updateStatus("Ready. Please select an image.");
+        } catch (error) {
+          updateStatus("Failed to load the model. Please refresh.");
+          console.error("Model loading error:", error);
+        }
+
+        imageLoader.addEventListener("change", handleImageUpload);
+        exampleBtn.addEventListener("click", handleExample);
+        imageCanvas.addEventListener("mousemove", handleMouseMove);
+        imageCanvas.addEventListener("mouseleave", clearHighlights);
+        imageCanvas.addEventListener("touchmove", handleTouchMove);
+        imageCanvas.addEventListener("touchend", clearHighlights);
+        dropZone.addEventListener("dragover", handleDragOver);
+        dropZone.addEventListener("dragleave", handleDragLeave);
+        dropZone.addEventListener("drop", handleDrop);
+        modeToggle.addEventListener("change", handleModeChange);
+        scaleSlider.addEventListener("input", handleSliderInput);
+        scaleSlider.addEventListener("change", handleSliderChange);
+      }
+
+      async function handleExample() {
+        updateStatus("Loading example image...", true);
+        try {
+          const response = await fetch(EXAMPLE_IMAGE_URL);
+          const blob = await response.blob();
+          loadImageOntoCanvas(URL.createObjectURL(blob));
+        } catch (error) {
+          updateStatus("Failed to load example image.");
+          console.error("Example load error:", error);
+        }
+      }
+
+      function handleImageUpload(event) {
+        const file = event.target.files[0];
+        if (file) loadImageOntoCanvas(URL.createObjectURL(file));
+      }
+
+      function handleDragOver(event) {
+        event.preventDefault();
+        dropZone.classList.add("border-blue-500", "bg-gray-800");
+      }
+
+      function handleDragLeave(event) {
+        event.preventDefault();
+        dropZone.classList.remove("border-blue-500", "bg-gray-800");
+      }
+
+      function handleDrop(event) {
+        event.preventDefault();
+        dropZone.classList.remove("border-blue-500", "bg-gray-800");
+        const file = event.dataTransfer.files[0];
+        if (file && file.type.startsWith("image/")) {
+          // The label covers the whole dropzone, so we need to make sure the button can be clicked.
+          if (event.target.id === "exampleBtn") return;
+          loadImageOntoCanvas(URL.createObjectURL(file));
+        } else {
+          updateStatus("Please drop an image file.");
+        }
+      }
+
+      function handleModeChange(event) {
+        isOverlayMode = !event.target.checked;
+        if (lastHoverData) {
+          drawHighlights(lastHoverData.queryIndex, lastHoverData.allPatches);
+        } else {
+          clearHighlights();
+        }
+      }
+
+      function handleSliderInput(event) {
+        imageScale = parseFloat(event.target.value);
+        scaleValue.textContent = `${imageScale.toFixed(2)}x`;
+      }
+
+      function handleSliderChange() {
+        if (currentImageUrl) {
+          loadImageOntoCanvas(currentImageUrl);
+        }
+      }
+
+      function loadImageOntoCanvas(imageUrl) {
+        currentImageUrl = imageUrl;
+        originalImage = new Image();
+        originalImage.onload = async () => {
+          if (!patchSize) {
+            updateStatus("Error: Model not ready, patch size is unknown.");
+            return;
+          }
+
+          canvasPlaceholder.style.display = "none";
+          imageCanvas.style.display = "block";
+
+          let newWidth = originalImage.naturalWidth * imageScale;
+          let newHeight = originalImage.naturalHeight * imageScale;
+
+          const numPixels = newWidth * newHeight;
+          if (numPixels > maxPixels) {
+            const scaleRatio = Math.sqrt(maxPixels / numPixels);
+            newWidth *= scaleRatio;
+            newHeight *= scaleRatio;
+          }
+
+          const croppedWidth = Math.floor(newWidth / patchSize) * patchSize;
+          const croppedHeight = Math.floor(newHeight / patchSize) * patchSize;
+
+          if (croppedWidth < patchSize || croppedHeight < patchSize) {
+            updateStatus("Scaled image is too small to process.");
+            imageCanvas.style.display = "none";
+            canvasPlaceholder.style.display = "block";
+            canvasPlaceholder.textContent = "Scaled image is too small.";
+            return;
+          }
+
+          imageCanvas.width = croppedWidth;
+          imageCanvas.height = croppedHeight;
+          ctx.drawImage(originalImage, 0, 0, croppedWidth, croppedHeight);
+
+          await processImage();
+
+          setTimeout(() => {
+            canvasContainer.scrollIntoView({ behavior: "smooth", block: "center" });
+          }, 100);
+        };
+        originalImage.onerror = () => {
+          updateStatus("Failed to load the selected image.");
+          canvasPlaceholder.style.display = "block";
+          imageCanvas.style.display = "none";
+        };
+        originalImage.src = imageUrl;
+      }
+
+      async function processImage() {
+        if (!extractor) return;
+        updateStatus("Analyzing image... 🧠", true);
+        similarityScores = null;
+        lastHoverData = null;
+        try {
+          const imageData = await RawImage.fromCanvas(imageCanvas);
+          const features = await extractor(imageData, { pooling: "none" });
+          const numRegisterTokens = extractor.model.config.num_register_tokens ?? 0;
+          const startIndex = 1 + numRegisterTokens;
+          const patchFeatures = features.slice(null, [startIndex, null]);
+          const normalizedFeatures = patchFeatures.normalize(2, -1);
+          const scores = await matmul(normalizedFeatures, normalizedFeatures.permute(0, 2, 1));
+          similarityScores = (await scores.tolist())[0];
+          updateStatus(
+            `Image processed (${imageCanvas.width}x${imageCanvas.height}). Move over the image to explore features. ✨`,
+          );
+        } catch (error) {
+          updateStatus("An error occurred during image processing.");
+          console.error("Processing error:", error);
+        }
+      }
+
+      function handleTouchMove(event) {
+        event.preventDefault();
+        if (event.touches.length > 0) {
+          handleMouseMove(event.touches[0]);
+        }
+      }
+
+      function handleMouseMove(event) {
+        lastMouseEvent = event;
+        if (!animationFrameId) {
+          animationFrameId = requestAnimationFrame(drawLoop);
+        }
+      }
+
+      function drawLoop() {
+        if (!lastMouseEvent || !similarityScores || !originalImage) {
+          animationFrameId = null;
+          return;
+        }
+
+        const event = lastMouseEvent;
+        const rect = imageCanvas.getBoundingClientRect();
+        const scaleX = imageCanvas.width / rect.width;
+        const scaleY = imageCanvas.height / rect.height;
+        const x = (event.clientX - rect.left) * scaleX;
+        const y = (event.clientY - rect.top) * scaleY;
+
+        if (x < 0 || x >= imageCanvas.width || y < 0 || y >= imageCanvas.height) {
+          animationFrameId = null;
+          return;
+        }
+
+        const patchesPerRow = imageCanvas.width / patchSize;
+        const patchX = Math.floor(x / patchSize);
+        const patchY = Math.floor(y / patchSize);
+        const queryPatchIndex = patchY * patchesPerRow + patchX;
+
+        if (queryPatchIndex < 0 || queryPatchIndex >= similarityScores.length || !similarityScores[queryPatchIndex]) {
+          animationFrameId = null;
+          return;
+        }
+
+        const allPatches = Array.from(similarityScores[queryPatchIndex]).map((score, index) => ({ score, index }));
+
+        lastHoverData = { queryIndex: queryPatchIndex, allPatches };
+        drawHighlights(queryPatchIndex, allPatches);
+
+        animationFrameId = null;
+      }
+
+      const INFERNO_COLORMAP = [
+        [0.0, [0, 0, 4]],
+        [0.1, [39, 12, 69]],
+        [0.2, [84, 15, 104]],
+        [0.3, [128, 31, 103]],
+        [0.4, [170, 48, 88]],
+        [0.5, [209, 70, 68]],
+        [0.6, [240, 97, 47]],
+        [0.7, [253, 138, 28]],
+        [0.8, [252, 185, 26]],
+        [0.9, [240, 231, 56]],
+        [1.0, [252, 255, 160]],
+      ];
+
+      function getInfernoColor(t) {
+        for (let i = 1; i < INFERNO_COLORMAP.length; i++) {
+          const [t_prev, c_prev] = INFERNO_COLORMAP[i - 1];
+          const [t_curr, c_curr] = INFERNO_COLORMAP[i];
+          if (t <= t_curr) {
+            const t_interp = (t - t_prev) / (t_curr - t_prev);
+            const r = c_prev[0] + t_interp * (c_curr[0] - c_prev[0]);
+            const g = c_prev[1] + t_interp * (c_curr[1] - c_prev[1]);
+            const b = c_prev[2] + t_interp * (c_curr[2] - c_prev[2]);
+            return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`;
+          }
+        }
+        return `rgb(${INFERNO_COLORMAP[INFERNO_COLORMAP.length - 1][1].join(",")})`;
+      }
+
+      function drawHighlights(queryIndex, allPatches) {
+        const patchesPerRow = imageCanvas.width / patchSize;
+
+        if (isOverlayMode) {
+          ctx.drawImage(originalImage, 0, 0, imageCanvas.width, imageCanvas.height);
+          ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+          ctx.fillRect(0, 0, imageCanvas.width, imageCanvas.height);
+        } else {
+          ctx.fillStyle = getInfernoColor(0);
+          ctx.fillRect(0, 0, imageCanvas.width, imageCanvas.height);
+        }
+
+        if (allPatches.length > 0) {
+          const scores = allPatches.map((p) => p.score);
+          const minScore = Math.min(...scores);
+          const maxScore = Math.max(...scores);
+          const scoreRange = maxScore - minScore;
+
+          for (const patch of allPatches) {
+            if (patch.index === queryIndex) continue;
+            const normalizedScore = scoreRange > 0.0001 ? (patch.score - minScore) / scoreRange : 1;
+            const patchY = Math.floor(patch.index / patchesPerRow);
+            const patchX = patch.index % patchesPerRow;
+
+            if (isOverlayMode) {
+              const brightness = Math.pow(normalizedScore, 2) * 0.8;
+              ctx.fillStyle = `rgba(255, 255, 255, ${brightness})`;
+            } else {
+              ctx.fillStyle = getInfernoColor(normalizedScore);
+            }
+            ctx.fillRect(patchX * patchSize, patchY * patchSize, patchSize, patchSize);
+          }
+        }
+
+        const queryY = Math.floor(queryIndex / patchesPerRow);
+        const queryX = queryIndex % patchesPerRow;
+        ctx.strokeStyle = isOverlayMode ? "rgba(129, 188, 255, 0.9)" : "cyan";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(queryX * patchSize, queryY * patchSize, patchSize, patchSize);
+      }
+
+      function clearHighlights() {
+        if (animationFrameId) {
+          cancelAnimationFrame(animationFrameId);
+          animationFrameId = null;
+        }
+        lastMouseEvent = null;
+        lastHoverData = null;
+        if (originalImage) {
+          ctx.drawImage(originalImage, 0, 0, imageCanvas.width, imageCanvas.height);
+        }
+      }
+
+      initialize();
+    </script>
+  </body>
+</html>
