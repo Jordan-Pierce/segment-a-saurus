@@ -9,6 +9,7 @@ import time
 # --- NEW IMPORT ---
 from sklearn.linear_model import LogisticRegression
 
+
 class DinoSegmenter:
     """
     A class for high-resolution, interactive segmentation using
@@ -220,9 +221,8 @@ class DinoSegmenter:
     @torch.no_grad()
     def predict_mask(self) -> np.ndarray:
         """
-        Predicts a pixel-perfect mask.
-        - If only positive prompts are given, returns a similarity map.
-        - If positive and negative prompts are given, trains a classifier.
+        Predicts a pixel-perfect mask by training a real-time
+        classifier on the current prompts.
                                
         Returns:
             np.ndarray: A [H_proc, W_proc] float array (0.0 to 1.0)
@@ -239,12 +239,9 @@ class DinoSegmenter:
             
         labels = set(p['label'] for p in self.prompts)
         
-        # --- START: NEW HYBRID LOGIC ---
-        
         if len(labels) == 1:
             # --- MODE 1: Similarity Search (Only one class of prompts) ---
             if 1 in labels:
-                # Only positive prompts
                 print("Only positive prompts found. Running similarity search...")
                 
                 # 1. Get all positive features
@@ -254,15 +251,10 @@ class DinoSegmenter:
                         y, x = prompt['coords']
                         pos_features.append(self.hr_features[y, x])
                 
-                # 2. Flatten all features
                 all_features = self.hr_features.reshape(-1, C)
-                
-                # 3. Calculate similarity
                 confidence_map = self._calculate_similarity(all_features, pos_features)
                 
-                # 4. Dynamically normalize the result to [0, 1]
-                min_val = torch.min(confidence_map)
-                max_val = torch.max(confidence_map)
+                min_val, max_val = torch.min(confidence_map), torch.max(confidence_map)
                 if min_val == max_val:
                     normalized_map = (confidence_map > 0).float()
                 else:
@@ -280,10 +272,8 @@ class DinoSegmenter:
             # --- MODE 2: Classifier (Positive AND Negative prompts) ---
             print("Training real-time classifier...")
             
-            # 1. Build Training Set
             X_train_list = []
             y_train = []
-            
             for prompt in self.prompts:
                 y, x = prompt['coords']
                 label = prompt['label']
@@ -293,7 +283,6 @@ class DinoSegmenter:
             X_train = torch.stack(X_train_list).cpu().numpy()
             y_train = np.array(y_train)
 
-            # 2. Train Classifier
             clf = LogisticRegression(
                 class_weight='balanced', 
                 random_state=0, 
@@ -301,15 +290,59 @@ class DinoSegmenter:
             )
             clf.fit(X_train, y_train)
 
-            # 3. Predict on Full Feature Map
             print("Predicting on full high-res feature map...")
             all_features = self.hr_features.reshape(-1, C).cpu().numpy()
             confidence_map = clf.predict_proba(all_features)[:, 1]
             
             print("Prediction complete.")
-            
-            # 4. Reshape back to [H, W] and return
             return confidence_map.reshape(H_proc, W_proc).astype(np.float32)
+        
+    def post_process_mask(self, confidence_map: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+        """
+        Aligns the processed confidence map with the original image.
+        
+        Takes the small, square confidence_map, applies a threshold,
+        pastes it into the center of a resized canvas, and then
+        resizes it back to the original image's dimensions.
+        
+        Args:
+            confidence_map (np.ndarray): The [H_proc, W_proc] map from predict_mask().
+            threshold (float): The cutoff to create the binary mask.
+            
+        Returns:
+            np.ndarray: A [H_orig, W_orig] boolean mask.
+        """
+        if self.transform_info is None:
+            raise RuntimeError("set_image() must be called before post-processing.")
+            
+        # 1. Apply threshold
+        binary_mask = (confidence_map > threshold)
+        
+        # 2. Get transform info
+        info = self.transform_info
+        W_orig, H_orig = info["original_size"]
+        scale = info["resize_scale"]
+        
+        # 3. Calculate the "resized-but-not-cropped" dimensions
+        new_H = int(H_orig * scale)
+        new_W = int(W_orig * scale)
+        
+        # 4. Create a blank canvas with these dimensions
+        uncropped_mask = np.zeros((new_H, new_W), dtype=np.uint8)
+        
+        # 5. Paste the binary_mask into the center
+        top, left = info["crop_top"], info["crop_left"]
+        H_proc, W_proc = info["processed_size"]
+        
+        mask_to_paste = (binary_mask * 255).astype(np.uint8)
+        uncropped_mask[top : top + H_proc, left : left + W_proc] = mask_to_paste
+        
+        # 6. Resize this correctly aligned mask to the *original* image size
+        mask_img = Image.fromarray(uncropped_mask)
+        mask_resized = np.array(mask_img.resize((W_orig, H_orig), Image.NEAREST))
+        
+        # 7. Return as boolean
+        return (mask_resized > 0)
 
 
 # --- Simple command-line test ---
@@ -317,11 +350,11 @@ if __name__ == "__main__":
     import os
     
     TEST_IMAGE_PATH = "data/veggies.jpg" 
-    PROCESSING_RESOLUTION = 448
+    PROCESSING_RESOLUTION = 1024
     DINOV3_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"  # Patch size 16
     
-    point = (110, 310)  # Hanging tomato (y, x)
-
+    point = (110, 310)  # y, x coordinate of a hanging tomato
+        
     if not os.path.exists(TEST_IMAGE_PATH):
         print(f"Error: Test image not found at '{TEST_IMAGE_PATH}'")
     else:
@@ -344,67 +377,33 @@ if __name__ == "__main__":
             # 4. Add dummy prompts
             H, W, _ = image_np.shape
             segmenter.add_prompt(original_coords=point, is_positive=True)  # Hanging tomato
-            # Add a negative point to use the classifier
-            segmenter.add_prompt(original_coords=(10, 10), is_positive=False) # Background
+            segmenter.add_prompt(original_coords=(10, 10), is_positive=False)  # Background
 
             # 5. Run prediction
             t0 = time.time()
             confidence_map = segmenter.predict_mask()
             print(f"predict_mask (train + predict) time: {time.time() - t0:.2f}s")
-            print(f"Confidence map min: {confidence_map.min():.4f}, max: {confidence_map.max():.4f}")
+                        
+            # 6. Post-process the mask
+            t0 = time.time()
+            final_mask = segmenter.post_process_mask(confidence_map, threshold=0.90)
+            print(f"post_process_mask time: {time.time() - t0:.2f}s")
             
-            # 6. Apply threshold
-            binary_mask = (confidence_map > 0.75)
-
             # 7. Plot
             fig, axs = plt.subplots(1, 3, figsize=(18, 6))
             
-            axs[0].plot(point[1], point[0], 'go', markersize=3)  # Mark positive prompt (green)
-            axs[0].plot(10, 10, 'ro', markersize=3)  # Mark negative prompt (red)
+            axs[0].plot(point[1], point[0], 'ro', markersize=3)  # Mark the prompt
             axs[0].imshow(image_np)
             axs[0].set_title("Original Image")
             axs[0].axis("off")
             
-            im = axs[1].imshow(confidence_map, cmap='inferno')
+            axs[1].imshow(confidence_map, cmap='inferno')
             axs[1].set_title(f"Confidence Map ({confidence_map.shape[0]}x{confidence_map.shape[1]})")
             axs[1].axis("off")
-            fig.colorbar(im, ax=axs[1])
-
-            # --- START: CORRECTED MASK RESIZING ---
-            
-            # 1. Get the transform info
-            info = segmenter.transform_info
-            W_orig, H_orig = info["original_size"]
-            scale = info["resize_scale"]
-            
-            # 2. Calculate the "resized-but-not-cropped" dimensions
-            new_H = int(H_orig * scale)
-            new_W = int(W_orig * scale)
-            
-            # 3. Create a blank canvas with these dimensions
-            # We use uint8 (0-255) for pasting
-            uncropped_mask = np.zeros((new_H, new_W), dtype=np.uint8)
-            
-            # 4. Paste the binary_mask into the center, using the crop offsets
-            top, left = info["crop_top"], info["crop_left"]
-            H_proc, W_proc = info["processed_size"]
-            
-            # Convert boolean mask to uint8 (0 or 255) for pasting
-            mask_to_paste = (binary_mask * 255).astype(np.uint8)
-            uncropped_mask[top: top + H_proc, left: left + W_proc] = mask_to_paste
-            
-            # 5. Now, resize this correctly aligned mask to the *original* image size
-            mask_img = Image.fromarray(uncropped_mask)
-            mask_resized = np.array(mask_img.resize((W_orig, H_orig), Image.NEAREST))
-            
-            # Convert back to boolean for the overlay logic
-            final_mask_bool = (mask_resized > 0)
-            
-            # --- END: CORRECTED MASK RESIZING ---
 
             # Create an overlay
             overlay = image_np.copy()
-            overlay[final_mask_bool] = [255, 255, 255]  # Highlight mask in white
+            overlay[final_mask] = [255, 255, 255]  # Highlight mask in white
             
             axs[2].imshow(image_np)
             axs[2].imshow(overlay, alpha=0.5)

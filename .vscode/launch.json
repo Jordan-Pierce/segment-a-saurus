@@ -8,7 +8,7 @@
             "name": "Run Demo",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/qtdemo.py",
+            "program": "${workspaceFolder}/qtdemo_segmenter.py",
             "args": ["--resolution", "1024"],
             "console": "integratedTerminal"
         }

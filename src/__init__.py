@@ -1,3 +1,4 @@
 from .DinoVisualizer import DinoVisualizer
+from .DinoSegmenter import DinoSegmenter
 
-__all__ = ["DinoVisualizer"]
+__all__ = ["DinoVisualizer", "DinoSegmenter"]
