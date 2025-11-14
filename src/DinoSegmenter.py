@@ -6,26 +6,17 @@ from transformers import AutoImageProcessor, AutoModel
 import torchvision.transforms.v2 as T 
 import matplotlib.pyplot as plt
 import time
-
-
-pretrained_model_names = [
-    
-    "facebook/dinov3-vits16plus-pretrain-lvd1689m"
-    "facebook/dinov3-vits16-pretrain-lvd1689m",
-    "facebook/dinov3-vit7b16-pretrain-lvd1689m",
-    
-    "facebook/dinov3-convnext-tiny-pretrain-lvd1689m"
-]
-
+# --- NEW IMPORT ---
+from sklearn.linear_model import LogisticRegression
 
 class DinoSegmenter:
     """
-    A class to encapsulate the DINOv3 + AnyUp feature extraction pipeline
-    for high-resolution, pixel-level semantic features.
+    A class for high-resolution, interactive segmentation using
+    DINOv3, AnyUp, and a real-time classifier.
     """
     
     def __init__(self, 
-                 dino_model_name: str = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m", 
+                 dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m", 
                  device: str = None):
         """
         Initializes the segmenter by loading both DINOv3 and AnyUp models.
@@ -50,7 +41,7 @@ class DinoSegmenter:
             self.processor = AutoImageProcessor.from_pretrained(dino_model_name)
             self.model = AutoModel.from_pretrained(
                 dino_model_name,
-                torch_dtype=torch.float16, # Load DINOv3 in float16
+                torch_dtype=torch.float16,
                 device_map="auto",
                 attn_implementation=attn_impl,
             ).to(self.device).eval()
@@ -58,7 +49,7 @@ class DinoSegmenter:
             if self.is_vit:
                 self.patch_size = self.model.config.patch_size
             else:
-                self.patch_size = 32 # Total stride for ConvNeXt
+                self.patch_size = 32
                 
         except Exception as e:
             print(f"Error loading DINOv3 model: {e}")
@@ -67,37 +58,38 @@ class DinoSegmenter:
         # 2. Load AnyUp Model
         try:
             print("Loading AnyUp model from torch.hub...")
-            # AnyUp loads in float32 by default
             self.upsampler = torch.hub.load("wimmerth/anyup", "anyup", verbose=False).to(self.device).eval()
         except Exception as e:
             print(f"Error loading AnyUp model: {e}")
             raise
+        
+        # --- NEW: Initialize state for segmentation ---
+        self.hr_features = None # Will store the [C, H, W] pixel features
+        self.prompts = []       # Will store user clicks
+        self.transform_info = {} # Will store info to map clicks
             
         print("DinoSegmenter initialized successfully.")
 
     @torch.no_grad()
-    def extract_features(self, image: np.ndarray, target_res: int = 1024):
+    def set_image(self, image: np.ndarray, target_res: int = 1024):
         """
-        Runs the full DINOv3 + AnyUp pipeline on an image.
+        Runs the full DINOv3 + AnyUp pipeline on an image and
+        stores the resulting high-resolution feature map.
         
         Args:
             image (np.ndarray): The input image as an RGB numpy array [H, W, 3].
-            target_res (int): The resolution to process the image at. Must be a
-                              multiple of the model's patch size.
-                              
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - lr_features: Low-res features (float16) [1, C, H_grid, W_grid]
-                - hr_features: High-res features (float32) [1, C, H_proc, W_proc]
+            target_res (int): The resolution to process the image at.
         """
         if not isinstance(image, np.ndarray):
             raise TypeError("Input image must be a numpy array.")
             
         if target_res % self.patch_size != 0:
-            raise ValueError(f"target_res ({target_res}) must be a multiple of patch_size ({self.patch_size}).")
+            target_res = (target_res // self.patch_size) * self.patch_size
+            print(f"Warning: target_res adjusted to {target_res} to be a multiple of {self.patch_size}")
 
-        print(f"Extracting features at {target_res}x{target_res} resolution...")
+        print(f"Setting image: extracting features at {target_res}x{target_res} resolution...")
         img_pil = Image.fromarray(image).convert("RGB")
+        W_orig, H_orig = img_pil.size
         
         # --- 1. Create the manual transform ---
         mean = self.processor.image_mean
@@ -105,16 +97,14 @@ class DinoSegmenter:
         
         transforms = T.Compose([
             T.ToImage(),
-            T.ToDtype(torch.float32, scale=True), # <-- Create as float32
+            T.ToDtype(torch.float32, scale=True),
             T.Resize(size=target_res, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
             T.CenterCrop(target_res),
             T.Normalize(mean=mean, std=std),
         ])
 
         # --- 2. Apply transforms ---
-        # Create the tensor as float32
         hr_image_tensor_f32 = transforms(img_pil).to(self.device).unsqueeze(0)
-        
         B, C, H_proc, W_proc = hr_image_tensor_f32.shape
         h_grid = H_proc // self.patch_size
         w_grid = W_proc // self.patch_size
@@ -122,102 +112,218 @@ class DinoSegmenter:
 
         # --- 3. DINOv3 Pass (Get Low-Res Features) ---
         print("Running DINOv3 pass...")
-        # Convert to float16 *only* for the DINOv3 model pass
         out = self.model(pixel_values=hr_image_tensor_f32.to(torch.float16))
-        hs = out.last_hidden_state # Output is float16
-        
-        patch_features = hs.squeeze(0)[-n_patches:, :] # [N, C] (float16)
-        
-        if patch_features.shape[0] != n_patches:
-             raise RuntimeError("Feature extraction failed! Mismatch in patch count.")
-        
-        # Reshape to [B, C, H_grid, W_grid] for AnyUp
+        hs = out.last_hidden_state 
+        patch_features = hs.squeeze(0)[-n_patches:, :] 
         lr_features_f16 = patch_features.permute(1, 0).reshape(1, -1, h_grid, w_grid).contiguous()
 
         # --- 4. AnyUp Pass (Get High-Res Features) ---
         print("Running AnyUp pass...")
-        
-        # --- START: THE FIX ---
-        # Convert *both* inputs to float32 to match AnyUp's weights
         hr_features = self.upsampler(
-            hr_image_tensor_f32,                # Pass the float32 image
-            lr_features_f16.to(torch.float32),  # Convert features to float32
+            hr_image_tensor_f32,
+            lr_features_f16.to(torch.float32),
             q_chunk_size=256
         )
-        # --- END: THE FIX ---
         
-        print("Feature extraction complete.")
-        # Return lr_features as float16 and hr_features as float32
-        return lr_features_f16, hr_features
-
-    @staticmethod
+        # --- 5. Store state ---
+        # Squeeze batch dim and permute to [H, W, C] for easier indexing
+        self.hr_features = hr_features.squeeze(0).permute(1, 2, 0) 
+        self.prompts = []
+        
+        # Store info needed to map clicks from original image to processed image
+        scale_factor = target_res / min(W_orig, H_orig)
+        new_W = int(W_orig * scale_factor)
+        new_H = int(H_orig * scale_factor)
+        
+        self.transform_info = {
+            "original_size": (W_orig, H_orig),
+            "processed_size": (H_proc, W_proc),
+            "resize_scale": scale_factor,
+            "crop_top": (new_H - target_res) // 2,
+            "crop_left": (new_W - target_res) // 2,
+        }
+        
+        print(f"Feature extraction complete. Stored features: {self.hr_features.shape}")
+        
     @torch.no_grad()
-    def visualize_features(lr_features: torch.Tensor, hr_features: torch.Tensor):
+    def _calculate_similarity(self, all_features, prompt_features_list) -> torch.Tensor:
+        """Helper to compute max similarity against a list of prompt features."""
+        n_pixels, c = all_features.shape
+        if not prompt_features_list:
+            return torch.zeros(n_pixels, device=self.device)
+            
+        prompt_stack = torch.stack(prompt_features_list)
+        
+        # Normalize for cosine similarity
+        all_norm = F.normalize(all_features, p=2, dim=1)
+        prompt_norm = F.normalize(prompt_stack, p=2, dim=1)
+        
+        # (N_pixels, C) @ (C, N_prompts) -> (N_pixels, N_prompts)
+        similarity = torch.matmul(all_norm, prompt_norm.T)
+        
+        # Take the max similarity for each pixel against all prompt features
+        max_similarity, _ = torch.max(similarity, dim=1)
+        
+        return max_similarity
+
+    def _transform_coords(self, original_coords: tuple) -> tuple | None:
+        """Transforms (y, x) from original image to processed feature map."""
+        y_click, x_click = original_coords
+        
+        # 1. Simulate the resize
+        y_resized = int(y_click * self.transform_info["resize_scale"])
+        x_resized = int(x_click * self.transform_info["resize_scale"])
+        
+        # 2. Simulate the center crop
+        y_proc = y_resized - self.transform_info["crop_top"]
+        x_proc = x_resized - self.transform_info["crop_left"]
+        
+        # 3. Check if click is inside the cropped area
+        H_proc, W_proc = self.transform_info["processed_size"]
+        if 0 <= y_proc < H_proc and 0 <= x_proc < W_proc:
+            return (y_proc, x_proc)
+        else:
+            return None # Click was outside the processed area
+
+    # --- NEW INTERACTIVE METHODS ---
+
+    def add_prompt(self, original_coords: tuple, is_positive: bool):
         """
-        Performs a joint PCA on low-res and high-res features
-        and returns them as plottable RGB images.
+        Adds a single point prompt (positive or negative) to the list.
+        
+        Args:
+            original_coords (tuple): (y, x) coordinates from the original image.
+            is_positive (bool): True for foreground (label 1), False for background (label 0).
         """
-        print("Performing joint PCA for visualization...")
+        processed_coords = self._transform_coords(original_coords)
         
-        # --- This logic is adapted directly from the AnyUp demo script ---
-        #
-        
-        # Convert both to float32 for PCA
-        lr_features = lr_features.to(torch.float32)
-        hr_features = hr_features.to(torch.float32)
+        if processed_coords:
+            label = 1 if is_positive else 0
+            self.prompts.append({"coords": processed_coords, "label": label})
+            print(f"Added {'positive' if is_positive else 'negative'} prompt at {processed_coords}.")
+        else:
+            print("Click was outside the processed image area, prompt ignored.")
 
-        # 1. Get shapes
-        _, C, h_grid, w_grid = lr_features.shape
-        _, _, h_proc, w_proc = hr_features.shape
-        n_lr = h_grid * w_grid
-        
-        # 2. Flatten both feature maps
-        lr_flat = lr_features[0].permute(1, 2, 0).reshape(-1, C)
-        hr_flat = hr_features[0].permute(1, 2, 0).reshape(-1, C)
-        all_feats = torch.cat([lr_flat, hr_flat], dim=0)
+    def clear_prompts(self):
+        """Removes all active prompts."""
+        self.prompts = []
+        print("All prompts cleared.")
 
-        # 3. Compute PCA
-        mean = all_feats.mean(dim=0, keepdim=True)
-        X = all_feats - mean
-        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
-        pcs = Vh[:3].T # Top 3 principal components
-        proj_all = X @ pcs
+    def undo_prompt(self):
+        """Removes the most recently added prompt."""
+        if self.prompts:
+            removed = self.prompts.pop()
+            print(f"Removed last prompt at {removed['coords']}.")
+        else:
+            print("No prompts to undo.")
 
-        # 4. Split back and normalize
-        proj_lr = proj_all[:n_lr].reshape(h_grid, w_grid, 3)
-        proj_hr = proj_all[n_lr:].reshape(h_proc, w_proc, 3)
+    @torch.no_grad()
+    def predict_mask(self) -> np.ndarray:
+        """
+        Predicts a pixel-perfect mask.
+        - If only positive prompts are given, returns a similarity map.
+        - If positive and negative prompts are given, trains a classifier.
+                               
+        Returns:
+            np.ndarray: A [H_proc, W_proc] float array (0.0 to 1.0)
+                        representing the foreground confidence map.
+        """
+        if self.hr_features is None:
+            raise RuntimeError("An image must be set with set_image() before predicting.")
         
-        cmin = proj_all.min(dim=0).values
-        cmax = proj_all.max(dim=0).values
-        crng = (cmax - cmin).clamp(min=1e-6)
+        H_proc, W_proc, C = self.hr_features.shape
+        
+        if len(self.prompts) == 0:
+            print("No prompts provided. Returning empty map.")
+            return np.zeros((H_proc, W_proc), dtype=np.float32)
+            
+        labels = set(p['label'] for p in self.prompts)
+        
+        # --- START: NEW HYBRID LOGIC ---
+        
+        if len(labels) == 1:
+            # --- MODE 1: Similarity Search (Only one class of prompts) ---
+            if 1 in labels:
+                # Only positive prompts
+                print("Only positive prompts found. Running similarity search...")
+                
+                # 1. Get all positive features
+                pos_features = []
+                for prompt in self.prompts:
+                    if prompt['label'] == 1:
+                        y, x = prompt['coords']
+                        pos_features.append(self.hr_features[y, x])
+                
+                # 2. Flatten all features
+                all_features = self.hr_features.reshape(-1, C)
+                
+                # 3. Calculate similarity
+                confidence_map = self._calculate_similarity(all_features, pos_features)
+                
+                # 4. Dynamically normalize the result to [0, 1]
+                min_val = torch.min(confidence_map)
+                max_val = torch.max(confidence_map)
+                if min_val == max_val:
+                    normalized_map = (confidence_map > 0).float()
+                else:
+                    normalized_map = (confidence_map - min_val) / (max_val - min_val)
+                
+                print("Similarity search complete.")
+                return normalized_map.reshape(H_proc, W_proc).cpu().numpy()
+            
+            else:
+                # Only negative prompts
+                print("Only negative prompts found. Returning empty map.")
+                return np.zeros((H_proc, W_proc), dtype=np.float32)
 
-        lr_rgb = ((proj_lr - cmin) / crng).cpu().numpy()
-        hr_rgb = ((proj_hr - cmin) / crng).cpu().numpy()
-        
-        print("PCA visualization complete.")
-        return lr_rgb, hr_rgb
-    
-    
+        else:
+            # --- MODE 2: Classifier (Positive AND Negative prompts) ---
+            print("Training real-time classifier...")
+            
+            # 1. Build Training Set
+            X_train_list = []
+            y_train = []
+            
+            for prompt in self.prompts:
+                y, x = prompt['coords']
+                label = prompt['label']
+                X_train_list.append(self.hr_features[y, x])
+                y_train.append(label)
+                
+            X_train = torch.stack(X_train_list).cpu().numpy()
+            y_train = np.array(y_train)
+
+            # 2. Train Classifier
+            clf = LogisticRegression(
+                class_weight='balanced', 
+                random_state=0, 
+                max_iter=1000
+            )
+            clf.fit(X_train, y_train)
+
+            # 3. Predict on Full Feature Map
+            print("Predicting on full high-res feature map...")
+            all_features = self.hr_features.reshape(-1, C).cpu().numpy()
+            confidence_map = clf.predict_proba(all_features)[:, 1]
+            
+            print("Prediction complete.")
+            
+            # 4. Reshape back to [H, W] and return
+            return confidence_map.reshape(H_proc, W_proc).astype(np.float32)
+
+
 # --- Simple command-line test ---
 if __name__ == "__main__":
     import os
     
-    # --- CONFIGURATION ---
-    # Put a test image in this path
     TEST_IMAGE_PATH = "data/veggies.jpg" 
+    PROCESSING_RESOLUTION = 448
+    DINOV3_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"  # Patch size 16
     
-    # Resolution to process at. Must be a multiple of 16 (for vits16) or 32 (for convnext)
-    # Use a smaller value (e.g., 448 or 512) for faster testing
-    PROCESSING_RESOLUTION = 448 
-    
-    # Model to test
-    # DINOV3_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m" # Patch size 16
-    DINOV3_MODEL = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m" # Patch size 32
-    # ---------------------
+    point = (110, 310)  # Hanging tomato (y, x)
 
     if not os.path.exists(TEST_IMAGE_PATH):
         print(f"Error: Test image not found at '{TEST_IMAGE_PATH}'")
-        print("Please create this file to run the test.")
     else:
         try:
             # 1. Load image
@@ -230,37 +336,82 @@ if __name__ == "__main__":
             segmenter = DinoSegmenter(dino_model_name=DINOV3_MODEL)
             print(f"Model init time: {time.time() - t0:.2f}s")
             
-            # Adjust resolution if needed for ConvNeXt
-            if PROCESSING_RESOLUTION % segmenter.patch_size != 0:
-                old_res = PROCESSING_RESOLUTION
-                PROCESSING_RESOLUTION = (old_res // segmenter.patch_size) * segmenter.patch_size
-                print(f"Warning: Adjusted resolution from {old_res} to {PROCESSING_RESOLUTION} "
-                      f"to be a multiple of patch size {segmenter.patch_size}")
-
-            # 3. Run pipeline
+            # 3. Run set_image (the slow step)
             t0 = time.time()
-            lr_features, hr_features = segmenter.extract_features(image_np, target_res=PROCESSING_RESOLUTION)
-            print(f"Full feature extraction time: {time.time() - t0:.2f}s")
+            segmenter.set_image(image_np, target_res=PROCESSING_RESOLUTION)
+            print(f"set_image (DINOv3 + AnyUp) time: {time.time() - t0:.2f}s")
             
-            print(f"LR features shape: {lr_features.shape}")
-            print(f"HR features shape: {hr_features.shape}")
+            # 4. Add dummy prompts
+            H, W, _ = image_np.shape
+            segmenter.add_prompt(original_coords=point, is_positive=True)  # Hanging tomato
+            # Add a negative point to use the classifier
+            segmenter.add_prompt(original_coords=(10, 10), is_positive=False) # Background
 
-            # 4. Visualize
+            # 5. Run prediction
             t0 = time.time()
-            lr_viz, hr_viz = DinoSegmenter.visualize_features(lr_features, hr_features)
-            print(f"PCA visualization time: {time.time() - t0:.2f}s")
+            confidence_map = segmenter.predict_mask()
+            print(f"predict_mask (train + predict) time: {time.time() - t0:.2f}s")
+            print(f"Confidence map min: {confidence_map.min():.4f}, max: {confidence_map.max():.4f}")
+            
+            # 6. Apply threshold
+            binary_mask = (confidence_map > 0.75)
 
-            # 5. Plot
-            fig, axs = plt.subplots(1, 2, figsize=(12, 6))
-            axs[0].imshow(lr_viz)
-            axs[0].set_title(f"Low-Res DINOv3 Features ({lr_viz.shape[0]}x{lr_viz.shape[1]})")
+            # 7. Plot
+            fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+            
+            axs[0].plot(point[1], point[0], 'go', markersize=3)  # Mark positive prompt (green)
+            axs[0].plot(10, 10, 'ro', markersize=3)  # Mark negative prompt (red)
+            axs[0].imshow(image_np)
+            axs[0].set_title("Original Image")
             axs[0].axis("off")
             
-            axs[1].imshow(hr_viz)
-            axs[1].set_title(f"High-Res AnyUp Features ({hr_viz.shape[0]}x{hr_viz.shape[1]})")
+            im = axs[1].imshow(confidence_map, cmap='inferno')
+            axs[1].set_title(f"Confidence Map ({confidence_map.shape[0]}x{confidence_map.shape[1]})")
             axs[1].axis("off")
+            fig.colorbar(im, ax=axs[1])
+
+            # --- START: CORRECTED MASK RESIZING ---
             
-            plt.suptitle(f"DINOv3 + AnyUp PCA Visualization\nModel: {DINOV3_MODEL.split('/')[-1]}")
+            # 1. Get the transform info
+            info = segmenter.transform_info
+            W_orig, H_orig = info["original_size"]
+            scale = info["resize_scale"]
+            
+            # 2. Calculate the "resized-but-not-cropped" dimensions
+            new_H = int(H_orig * scale)
+            new_W = int(W_orig * scale)
+            
+            # 3. Create a blank canvas with these dimensions
+            # We use uint8 (0-255) for pasting
+            uncropped_mask = np.zeros((new_H, new_W), dtype=np.uint8)
+            
+            # 4. Paste the binary_mask into the center, using the crop offsets
+            top, left = info["crop_top"], info["crop_left"]
+            H_proc, W_proc = info["processed_size"]
+            
+            # Convert boolean mask to uint8 (0 or 255) for pasting
+            mask_to_paste = (binary_mask * 255).astype(np.uint8)
+            uncropped_mask[top: top + H_proc, left: left + W_proc] = mask_to_paste
+            
+            # 5. Now, resize this correctly aligned mask to the *original* image size
+            mask_img = Image.fromarray(uncropped_mask)
+            mask_resized = np.array(mask_img.resize((W_orig, H_orig), Image.NEAREST))
+            
+            # Convert back to boolean for the overlay logic
+            final_mask_bool = (mask_resized > 0)
+            
+            # --- END: CORRECTED MASK RESIZING ---
+
+            # Create an overlay
+            overlay = image_np.copy()
+            overlay[final_mask_bool] = [255, 255, 255]  # Highlight mask in white
+            
+            axs[2].imshow(image_np)
+            axs[2].imshow(overlay, alpha=0.5)
+            axs[2].set_title("Final Mask Overlay (Aligned)")
+            axs[2].axis("off")
+            
+            plt.suptitle(f"DINOv3 + AnyUp + LogisticRegression Segmentation")
             plt.tight_layout()
             plt.show()
 
