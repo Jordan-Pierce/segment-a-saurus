@@ -15,7 +15,7 @@ class InteractiveVisualizerApp:
     replicating the original web demo.
     """
     
-    def __init__(self, folder_path: str):
+    def __init__(self, folder_path: str, max_res: int = 1024):
         self.window_name = "DINOv3 Similarity"
         
         # 1. Get all images in the folder
@@ -31,7 +31,7 @@ class InteractiveVisualizerApp:
         
         # 2. Initialize the segmenter
         try:
-            self.segmenter = DinoSegmenter()
+            self.segmenter = DinoSegmenter(max_resolution=max_res)
         except Exception as e:
             print(f"Fatal error: Could not initialize DinoSegmenter.")
             print(f"Error details: {e}")
@@ -162,8 +162,8 @@ class InteractiveVisualizerApp:
                 self._refresh()
                 
         cv2.destroyAllWindows()
+    
         
-
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(
@@ -174,10 +174,16 @@ if __name__ == "__main__":
         default="data/",
         help="Path to the folder containing images."
     )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=448,
+        help="Max resolution (in pixels) to process the image at. Smaller is faster."
+    )
     args = parser.parse_args()
     
     try:
-        app = InteractiveVisualizerApp(args.folder)
+        app = InteractiveVisualizerApp(args.folder, max_res=args.resolution)
         app.run()
     except ValueError as e:
         print(f"Error: {e}")

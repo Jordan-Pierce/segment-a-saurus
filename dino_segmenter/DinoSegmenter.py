@@ -10,12 +10,18 @@ class DinoSegmenter:
     """
     An API for visualizing DINOv3 feature similarity,
     using the exact logic from the provided Gradio app
-    AND processing the image at high resolution.
+    AND processing the image at a user-defined max resolution.
     """
     
-    def __init__(self, device: str = None):
+    def __init__(self, device: str = None, max_resolution: int = 1024):
         """
         Initializes the segmenter by loading the DINOv3 model.
+        
+        Args:
+            device (str, optional): The device to run models on ('cuda', 'cpu').
+            max_resolution (int): The maximum dimension (W or H) to process.
+                                  Images larger than this will be scaled down
+                                  before feature extraction to save memory/time.
         """
         print("Initializing DinoSegmenter with DINOv3 (ViT-S/16)...")
         if device:
@@ -23,6 +29,8 @@ class DinoSegmenter:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
+        
+        self.max_resolution = max_resolution
 
         # 1. Load DINOv3 Model from 'transformers'
         try:
@@ -30,7 +38,7 @@ class DinoSegmenter:
             self.processor = AutoImageProcessor.from_pretrained(pretrained_model_name)
             self.model = AutoModel.from_pretrained(
                 pretrained_model_name,
-                dtype=torch.float16,
+                torch_dtype=torch.float16,
                 device_map="auto",
                 attn_implementation="sdpa",
             ).to(self.device).eval()
@@ -46,11 +54,10 @@ class DinoSegmenter:
 
         print(f"DINOv3 ViT-S/16 model loaded. Patch size: {self.patch_size}")
 
-    # --- THIS METHOD IS COMPLETELY REPLACED ---
     @torch.no_grad()
     def set_image(self, image: np.ndarray):
         """
-        Sets and pre-processes the image at HIGH RESOLUTION.
+        Sets and pre-processes the image at the specified resolution.
         
         This runs the DINOv3 model ONCE and pre-computes the
         full N x N similarity matrix.
@@ -61,37 +68,44 @@ class DinoSegmenter:
         if not isinstance(image, np.ndarray):
             raise TypeError("Input image must be a numpy array.")
 
-        print("Setting new image (high-res) and pre-computing similarity matrix...")
+        print(f"Setting new image, max resolution {self.max_resolution}px...")
         img_pil = Image.fromarray(image).convert("RGB")
         self.original_image_size = img_pil.size # (W, H)
         
         # --- 1. Get original image size ---
         W, H = img_pil.size
         
-        # --- 2. Calculate new size that is a multiple of patch_size ---
-        # This is the web demo's exact logic
-        new_H = (H // self.patch_size) * self.patch_size
-        new_W = (W // self.patch_size) * self.patch_size
+        # --- 2. NEW: Scale down if larger than max_resolution ---
+        scale_factor = 1.0
+        if max(W, H) > self.max_resolution:
+            scale_factor = self.max_resolution / max(W, H)
+        
+        target_H = int(H * scale_factor)
+        target_W = int(W * scale_factor)
+
+        # --- 3. Calculate new size that is a multiple of patch_size ---
+        new_H = (target_H // self.patch_size) * self.patch_size
+        new_W = (target_W // self.patch_size) * self.patch_size
         
         if new_H == 0 or new_W == 0:
             raise ValueError(
-                f"Image size ({W}x{H}) is smaller than patch size ({self.patch_size})."
+                f"Scaled image size ({new_W}x{new_H}) is smaller than patch size "
+                f"({self.patch_size}). Try a larger max_resolution."
             )
 
-        # --- 3. Create the manual transform ---
-        # We resize/crop to this new, large size, then normalize
+        # --- 4. Create the manual transform ---
         mean = self.processor.image_mean
         std = self.processor.image_std
 
         high_res_transforms = T.Compose([
             T.ToImage(), # Convert PIL to tensor
             T.ToDtype(torch.float32, scale=True),
-            # Resize and crop to the *large* multiple of patch_size
+            # Resize and crop to the *scaled* multiple of patch_size
             T.Resize((new_H, new_W), antialias=True), 
             T.Normalize(mean=mean, std=std),
         ])
 
-        # --- 4. Apply the transforms ---
+        # --- 5. Apply the transforms ---
         img_tensor = high_res_transforms(img_pil).to(self.device, torch.float16).unsqueeze(0)
         
         B, C, H_proc, W_proc = img_tensor.shape
@@ -101,19 +115,18 @@ class DinoSegmenter:
         self.grid_size = (h_grid, w_grid)
         n_patches = h_grid * w_grid
 
-        # --- 5. Run the model on the high-res tensor ---
+        # --- 6. Run the model on the high-res tensor ---
         out = self.model(pixel_values=img_tensor)
         hs = out.last_hidden_state.squeeze(0)
         patch_features = hs[-n_patches:, :] # [N, C]
         
-        # --- 6. Pre-compute the N x N similarity matrix ---
+        # --- 7. Pre-compute the N x N similarity matrix ---
         print(f"Got {n_patches} patches ({h_grid}x{w_grid} grid). Computing {n_patches}x{n_patches} matrix...")
         
         patch_features_norm = F.normalize(patch_features, p=2, dim=1)
         self.similarity_matrix = torch.matmul(patch_features_norm, patch_features_norm.T)
         
         print("Similarity matrix computed and stored.")
-
 
     def _transform_coords(self, coords: tuple) -> int:
         """Transforms original (y, x) coords to a flat patch_index."""
