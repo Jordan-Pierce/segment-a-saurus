@@ -100,7 +100,6 @@ class DinoSegmenter:
             T.ToImage(),
             T.ToDtype(torch.float32, scale=True),
             T.Resize(size=target_res, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
-            T.CenterCrop(target_res),
             T.Normalize(mean=mean, std=std),
         ])
 
@@ -133,15 +132,13 @@ class DinoSegmenter:
         
         # Store info needed to map clicks from original image to processed image
         scale_factor = target_res / min(W_orig, H_orig)
-        new_W = int(round(W_orig * scale_factor))  
-        new_H = int(round(H_orig * scale_factor)) 
         
         self.transform_info = {
             "original_size": (W_orig, H_orig),
             "processed_size": (H_proc, W_proc),
             "resize_scale": scale_factor,
-            "crop_top": (new_H - target_res) // 2,
-            "crop_left": (new_W - target_res) // 2,
+            "crop_top": 0,
+            "crop_left": 0,
         }
         
         print(f"Feature extraction complete. Stored features: {self.hr_features.shape}")
@@ -184,7 +181,7 @@ class DinoSegmenter:
         if 0 <= y_proc < H_proc and 0 <= x_proc < W_proc:
             return (y_proc, x_proc)
         else:
-            return None # Click was outside the processed area
+            return None  # Click was outside the processed area
 
     # --- NEW INTERACTIVE METHODS ---
 
