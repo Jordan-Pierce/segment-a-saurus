@@ -12,7 +12,8 @@
             "args": [
                 "--resolution", "512", 
                 "--upsampler", "anyup",
-                "--segmenter", "torch"
+                "--segmenter", "torch",
+                "--resize-method", "pad"
             ],
             "console": "integratedTerminal"
         }

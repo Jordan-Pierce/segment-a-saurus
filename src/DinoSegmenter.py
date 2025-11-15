@@ -26,7 +26,8 @@ class DinoSegmenter:
                  dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m", 
                  device: str = None,
                  upsampling_method: str = "bilinear",
-                 segmenter_method: str = "torch"): 
+                 segmenter_method: str = "torch",
+                 resize_method: str = "pad"): 
         
         print(f"Initializing DinoSegmenter with {dino_model_name}...")
         if device:
@@ -43,6 +44,11 @@ class DinoSegmenter:
         if self.segmenter_method not in ["faiss", "torch"]:
             raise ValueError("segmenter_method must be 'faiss' or 'torch'")
         print(f"Using segmentation method: {self.segmenter_method}")
+        
+        self.resize_method = resize_method
+        if self.resize_method not in ["pad", "crop"]:
+            raise ValueError("resize_method must be 'pad' or 'crop'")
+        print(f"Using resize method: {self.resize_method}")
 
         self.is_vit = "vit" in dino_model_name.lower()
         attn_impl = "sdpa" if self.is_vit else "eager"
@@ -94,11 +100,12 @@ class DinoSegmenter:
         print("DinoSegmenter initialized successfully.")
 
     @torch.no_grad()
-    def set_image(self, image: np.ndarray, target_res: int = 1024):
+    def set_image(self, image: np.ndarray, target_res: int = 512):
         if not isinstance(image, np.ndarray):
             raise TypeError("Input image must be a numpy array.")
 
-        print(f"Setting image: resizing smallest edge to {target_res} and padding...")
+        action_desc = "padding" if self.resize_method == "pad" else "center cropping"
+        print(f"Setting image: resizing smallest edge to {target_res} and {action_desc}...")
         img_pil = Image.fromarray(image).convert("RGB")
         W_orig, H_orig = img_pil.size
         
@@ -106,28 +113,69 @@ class DinoSegmenter:
         mean = self.processor.image_mean
         std = self.processor.image_std
         
-        transforms_pre = T.Compose([
-            T.ToImage(),
-            T.ToDtype(torch.float32, scale=True),
-            T.Resize(size=target_res, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
-        ])
-        
-        img_tensor_unpadded = transforms_pre(img_pil)
-        _, H_proc_unpadded, W_proc_unpadded = img_tensor_unpadded.shape
-        
-        H_proc = (H_proc_unpadded + self.patch_size - 1) // self.patch_size * self.patch_size
-        W_proc = (W_proc_unpadded + self.patch_size - 1) // self.patch_size * self.patch_size
-        
-        padding_right = W_proc - W_proc_unpadded
-        padding_bottom = H_proc - H_proc_unpadded
-        
-        transforms_post = T.Compose([
-            T.Pad(padding=(0, 0, padding_right, padding_bottom), fill=0),
-            T.Normalize(mean=mean, std=std),
-        ])
+        if self.resize_method == "pad":
+            # Original padding logic
+            transforms_pre = T.Compose([
+                T.ToImage(),
+                T.ToDtype(torch.float32, scale=True),
+                T.Resize(size=target_res, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+            ])
+            
+            img_tensor_unpadded = transforms_pre(img_pil)
+            _, H_proc_unpadded, W_proc_unpadded = img_tensor_unpadded.shape
+            
+            H_proc = (H_proc_unpadded + self.patch_size - 1) // self.patch_size * self.patch_size
+            W_proc = (W_proc_unpadded + self.patch_size - 1) // self.patch_size * self.patch_size
+            
+            padding_right = W_proc - W_proc_unpadded
+            padding_bottom = H_proc - H_proc_unpadded
+            
+            transforms_post = T.Compose([
+                T.Pad(padding=(0, 0, padding_right, padding_bottom), fill=0),
+                T.Normalize(mean=mean, std=std),
+            ])
+            
+            hr_image_tensor_f32 = transforms_post(img_tensor_unpadded).to(self.device).unsqueeze(0)
+            
+        else:  # crop method
+            # Simplified approach: make a square crop at target_res x target_res
+            # Round down to nearest patch_size multiple
+            patches_per_side = target_res // self.patch_size
+            crop_size_processed = patches_per_side * self.patch_size
+            
+            # This will be our processed size (square)
+            H_proc = W_proc = crop_size_processed
+            
+            # Ensure we have at least one patch
+            if H_proc == 0:
+                H_proc = W_proc = self.patch_size
+            
+            # For center crop, we need to determine what size to crop from the original image
+            # We want the crop to fill the entire processed area after resize
+            # So we crop a square from the original image with size = min(W_orig, H_orig)
+            crop_size_orig = min(W_orig, H_orig)
+            
+            # But we need to ensure this doesn't go below our target
+            # If the original image is too small, we'll have to crop less
+            crop_h_orig = crop_w_orig = crop_size_orig
+            
+            transforms = T.Compose([
+                T.ToImage(),
+                T.ToDtype(torch.float32, scale=True),
+                T.CenterCrop(size=(crop_h_orig, crop_w_orig)),
+                T.Resize(size=(H_proc, W_proc), interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+                T.Normalize(mean=mean, std=std),
+            ])
+            
+            hr_image_tensor_f32 = transforms(img_pil).to(self.device).unsqueeze(0)
+            
+            # Calculate the scale factor from original crop to processed
+            scale = H_proc / crop_h_orig  # Should be same for both dimensions since both are square
+            
+            # For crop method, store the crop information for coordinate transformations
+            H_proc_unpadded, W_proc_unpadded = H_proc, W_proc
 
-        # --- 2. Apply transforms ---
-        hr_image_tensor_f32 = transforms_post(img_tensor_unpadded).to(self.device).unsqueeze(0)
+        # --- 2. Store processed tensor and calculate grid ---
         
         h_grid = H_proc // self.patch_size
         w_grid = W_proc // self.patch_size
@@ -172,14 +220,23 @@ class DinoSegmenter:
         self.hr_features = hr_features.squeeze(0).permute(1, 2, 0).to(torch.float32) 
         self.prompts = []
         
-        scale_factor = target_res / min(W_orig, H_orig)
-        
-        self.transform_info = {
-            "original_size": (W_orig, H_orig),
-            "processed_size": (H_proc, W_proc), 
-            "unpadded_size": (H_proc_unpadded, W_proc_unpadded),
-            "resize_scale": scale_factor,
-        }
+        if self.resize_method == "pad":
+            scale_factor = target_res / min(W_orig, H_orig)
+            self.transform_info = {
+                "original_size": (W_orig, H_orig),
+                "processed_size": (H_proc, W_proc), 
+                "unpadded_size": (H_proc_unpadded, W_proc_unpadded),
+                "resize_scale": scale_factor,
+                "resize_method": self.resize_method,
+            }
+        else:  # crop method
+            self.transform_info = {
+                "original_size": (W_orig, H_orig),
+                "processed_size": (H_proc, W_proc),
+                "crop_size_orig": (crop_h_orig, crop_w_orig),
+                "final_scale": scale,
+                "resize_method": self.resize_method,
+            }
         
         print(f"Feature extraction complete. Stored features: {self.hr_features.shape}")
         
@@ -205,20 +262,50 @@ class DinoSegmenter:
         Transforms (y, x) from original image to processed feature map.
         - 'anyup': returns (y, x) in PIXEL space.
         - 'bilinear': returns (y_med, x_med) in MEDIUM-RES space.
+        
+        Handles both 'pad' and 'crop' resize methods.
         """
         y_click, x_click = original_coords
         info = self.transform_info
         
-        # 1. Simulate the resize to get pixel coordinates
-        y_proc = int(y_click * info["resize_scale"])
-        x_proc = int(x_click * info["resize_scale"])
-        
-        # 2. Check if click is inside the un-padded area
-        H_unpadded, W_unpadded = info["unpadded_size"]
-        if not (0 <= y_proc < H_unpadded and 0 <= x_proc < W_unpadded):
-            return None # Click was outside the processed area
+        if info["resize_method"] == "pad":
+            # Original padding logic
+            # 1. Simulate the resize to get pixel coordinates
+            y_proc = int(y_click * info["resize_scale"])
+            x_proc = int(x_click * info["resize_scale"])
             
-        # 3. Return coordinates based on method
+            # 2. Check if click is inside the un-padded area
+            H_unpadded, W_unpadded = info["unpadded_size"]
+            if not (0 <= y_proc < H_unpadded and 0 <= x_proc < W_unpadded):
+                return None  # Click was outside the processed area
+        else:
+            # Crop method logic - new implementation
+            W_orig, H_orig = info["original_size"]
+            H_proc, W_proc = info["processed_size"]
+            crop_h_orig, crop_w_orig = info["crop_size_orig"]
+            scale = info["final_scale"]
+            
+            # Calculate center crop offsets in original coordinates
+            crop_y_orig = (H_orig - crop_h_orig) // 2
+            crop_x_orig = (W_orig - crop_w_orig) // 2
+            
+            # Check if click is within the cropped area in original coordinates
+            if not (crop_x_orig <= x_click < crop_x_orig + crop_w_orig and
+                    crop_y_orig <= y_click < crop_y_orig + crop_h_orig):
+                return None  # Click was outside the cropped area
+            
+            # Transform to crop-relative coordinates then scale to processed coordinates
+            y_crop_rel = y_click - crop_y_orig
+            x_crop_rel = x_click - crop_x_orig
+            
+            y_proc = int(y_crop_rel * scale)
+            x_proc = int(x_crop_rel * scale)
+            
+            # Clamp to processed dimensions
+            y_proc = max(0, min(y_proc, H_proc - 1))
+            x_proc = max(0, min(x_proc, W_proc - 1))
+            
+        # 3. Return coordinates based on upsampling method
         if self.upsampling_method == 'anyup':
             # AnyUp uses high-res pixel coordinates
             return (y_proc, x_proc)
@@ -238,18 +325,47 @@ class DinoSegmenter:
     def _transform_coords_to_patch(self, original_coords: tuple) -> int | None:
         """
         Transforms (y, x) from original image to a flat *patch* index.
+        Handles both 'pad' and 'crop' resize methods.
         """
         y_click, x_click = original_coords
         info = self.transform_info
         
-        # 1. Simulate the resize to get pixel coordinates
-        y_proc = int(y_click * info["resize_scale"])
-        x_proc = int(x_click * info["resize_scale"])
-        
-        # 2. Check if click is inside the un-padded area
-        H_unpadded, W_unpadded = info["unpadded_size"]
-        if not (0 <= y_proc < H_unpadded and 0 <= x_proc < W_unpadded):
-            return None # Click was outside the processed area
+        if info["resize_method"] == "pad":
+            # Original padding logic
+            # 1. Simulate the resize to get pixel coordinates
+            y_proc = int(y_click * info["resize_scale"])
+            x_proc = int(x_click * info["resize_scale"])
+            
+            # 2. Check if click is inside the un-padded area
+            H_unpadded, W_unpadded = info["unpadded_size"]
+            if not (0 <= y_proc < H_unpadded and 0 <= x_proc < W_unpadded):
+                return None  # Click was outside the processed area
+        else:
+            # Crop method logic - new implementation
+            W_orig, H_orig = info["original_size"]
+            H_proc, W_proc = info["processed_size"]
+            crop_h_orig, crop_w_orig = info["crop_size_orig"]
+            scale = info["final_scale"]
+            
+            # Calculate center crop offsets in original coordinates
+            crop_y_orig = (H_orig - crop_h_orig) // 2
+            crop_x_orig = (W_orig - crop_w_orig) // 2
+            
+            # Check if click is within the cropped area in original coordinates
+            if not (crop_x_orig <= x_click < crop_x_orig + crop_w_orig and
+                    crop_y_orig <= y_click < crop_y_orig + crop_h_orig):
+                return None  # Click was outside the cropped area
+            
+            # Transform to crop-relative coordinates then scale to processed coordinates
+            y_crop_rel = y_click - crop_y_orig
+            x_crop_rel = x_click - crop_x_orig
+            
+            y_proc = int(y_crop_rel * scale)
+            x_proc = int(x_crop_rel * scale)
+            
+            # Clamp to processed dimensions
+            y_proc = max(0, min(y_proc, H_proc - 1))
+            x_proc = max(0, min(x_proc, W_proc - 1))
             
         # 3. Convert pixel coordinates directly to grid coordinates
         h_grid, w_grid = self.grid_size
@@ -408,10 +524,10 @@ class DinoSegmenter:
     def post_process_mask(self, confidence_map: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
         Aligns the processed confidence map with the original image.
-        - 'anyup': Un-pads a high-res pixel mask.
-        - 'bilinear': Un-pads a medium-res pixel mask.
+        - For 'pad' resize method: Un-pads the mask and resizes to original.
+        - For 'crop' resize method: Resizes mask and places it back in original image bounds.
         
-        Both are upscaled with BICUBIC.
+        Both use BICUBIC upscaling.
         """
         if self.transform_info is None:
             raise RuntimeError("set_image() must be called before post-processing.")
@@ -420,30 +536,60 @@ class DinoSegmenter:
         
         info = self.transform_info
         W_orig, H_orig = info["original_size"]
-        H_unpadded, W_unpadded = info["unpadded_size"]
         
-        if self.upsampling_method == 'anyup':
-            # Un-pad the HIGH-RES pixel mask
-            uncropped_mask = binary_mask[0:H_unpadded, 0:W_unpadded]
-        
-        else:
-            # Un-pad the MEDIUM-RES mask
-            # We must calculate the unpadded medium-res size
-            med_res_scale_factor = self.bilinear_med_res_scale / self.patch_size
-            H_unpadded_med = int(H_unpadded * med_res_scale_factor)
-            W_unpadded_med = int(W_unpadded * med_res_scale_factor)
+        if info["resize_method"] == "pad":
+            # Original padding logic
+            H_unpadded, W_unpadded = info["unpadded_size"]
             
-            # Crop the medium-res mask
-            uncropped_mask = binary_mask[0:H_unpadded_med, 0:W_unpadded_med]
-        
-        # Now, upscale the (either high-res or med-res) uncropped mask
-        mask_img = Image.fromarray((uncropped_mask * 255).astype(np.uint8))
-        
-        mask_resized = np.array(mask_img.resize((W_orig, H_orig), Image.BICUBIC))
+            if self.upsampling_method == 'anyup':
+                # Un-pad the HIGH-RES pixel mask
+                uncropped_mask = binary_mask[0:H_unpadded, 0:W_unpadded]
+            else:
+                # Un-pad the MEDIUM-RES mask
+                # We must calculate the unpadded medium-res size
+                med_res_scale_factor = self.bilinear_med_res_scale / self.patch_size
+                H_unpadded_med = int(H_unpadded * med_res_scale_factor)
+                W_unpadded_med = int(W_unpadded * med_res_scale_factor)
+                
+                # Crop the medium-res mask
+                uncropped_mask = binary_mask[0:H_unpadded_med, 0:W_unpadded_med]
+            
+            # Resize the uncropped mask to original size
+            mask_img = Image.fromarray((uncropped_mask * 255).astype(np.uint8))
+            mask_resized = np.array(mask_img.resize((W_orig, H_orig), Image.BICUBIC))
+            
+        else:
+            # Crop method logic - simplified
+            crop_h_orig, crop_w_orig = info["crop_size_orig"]
+            
+            # The binary_mask is at the processed size (H_proc, W_proc)
+            # We need to resize it to the crop size and place it in the original image
+            
+            # Resize the processed mask to the original crop area size
+            mask_img = Image.fromarray((binary_mask * 255).astype(np.uint8))
+            mask_crop_resized = np.array(mask_img.resize((crop_w_orig, crop_h_orig), Image.BICUBIC))
+            
+            # Create full-size mask and place the resized crop in the center
+            mask_resized = np.zeros((H_orig, W_orig), dtype=np.uint8)
+            
+            # Calculate center crop offsets in original coordinates
+            crop_y_orig = (H_orig - crop_h_orig) // 2
+            crop_x_orig = (W_orig - crop_w_orig) // 2
+            
+            # Place the crop mask in the center of the original image
+            y_end = crop_y_orig + crop_h_orig
+            x_end = crop_x_orig + crop_w_orig
+            
+            # Ensure we don't go out of bounds
+            y_end = min(y_end, H_orig)
+            x_end = min(x_end, W_orig)
+            
+            mask_resized[crop_y_orig:y_end, crop_x_orig:x_end] = \
+                mask_crop_resized[0:y_end - crop_y_orig, 0:x_end - crop_x_orig]
         
         return (mask_resized > 128)
 
 
 # (Main test function is disabled)
 if __name__ == "__main__":
-    print("This file is intended to be used as a module.")
+    print("This file is intended to be used as a module.") 

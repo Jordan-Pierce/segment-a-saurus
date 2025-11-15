@@ -62,7 +62,8 @@ class InteractiveSegmenterApp(QWidget):
                  folder_path: str, 
                  max_res: int = 1024, 
                  upsampler: str = "anyup",
-                 segmenter: str = "faiss"):
+                 segmenter: str = "faiss",
+                 resize_method: str = "pad"):
         super().__init__()
         
         self.max_res = max_res
@@ -77,12 +78,13 @@ class InteractiveSegmenterApp(QWidget):
 
         try:
             self.segmenter = DinoSegmenter(upsampling_method=upsampler, 
-                                           segmenter_method=segmenter)
+                                           segmenter_method=segmenter,
+                                           resize_method=resize_method)
         except Exception as e:
             print(f"Fatal error: Could not initialize DinoSegmenter. Error: {e}")
             sys.exit(1)
         
-        title = f"DINOv3 Segmentation ({upsampler.upper()}) - PyQt5 Demo"
+        title = f"DINOv3 Segmentation ({upsampler.upper()}, {resize_method.upper()}) - PyQt5 Demo"
         self.setWindowTitle(title)
 
         print("Setting image... (This may take a moment on first run)")
@@ -206,11 +208,36 @@ class InteractiveSegmenterApp(QWidget):
                     confidence_map, threshold=0.5
                 )
 
+                # Debug output for crop method
+                if hasattr(self.segmenter, 'transform_info') and self.segmenter.transform_info.get("resize_method") == "crop":
+                    nonzero_count = np.count_nonzero(final_mask)
+                    if nonzero_count > 0:
+                        nonzero_indices = np.nonzero(final_mask)
+                        min_y, max_y = nonzero_indices[0].min(), nonzero_indices[0].max()
+                        min_x, max_x = nonzero_indices[1].min(), nonzero_indices[1].max()
+                        print(f"Crop mode: Mask has {nonzero_count} pixels, bounds Y:{min_y}-{max_y}, X:{min_x}-{max_x}")
+                        
+                        # Check if mask is in expected crop area
+                        info = self.segmenter.transform_info
+                        crop_h, crop_w = info["crop_size_orig"]
+                        orig_h, orig_w = info["original_size"]
+                        expected_y_start = (orig_h - crop_h) // 2
+                        expected_x_start = (orig_w - crop_w) // 2
+                        expected_y_end = expected_y_start + crop_h
+                        expected_x_end = expected_x_start + crop_w
+                        print(f"Expected crop area: Y:{expected_y_start}-{expected_y_end}, X:{expected_x_start}-{expected_x_end}")
+
                 # --- Overlay the mask ---
                 mask_uint8 = (final_mask * 255).astype(np.uint8)
                 H, W = final_mask.shape
                 q_image_mask = QImage(mask_uint8.data, W, H, W, QImage.Format_Grayscale8)
                 
+                current_pixmap = self.image_label.pixmap()
+                painter = QPainter(current_pixmap)
+                painter.setOpacity(0.5)
+                
+                # The final_mask from post_process_mask is already at original image size
+                # and properly positioned for both crop and pad modes, so we can treat them the same
                 widget_size = self.image_label.size()
                 scaled_mask = q_image_mask.scaled(
                     widget_size, 
@@ -219,13 +246,9 @@ class InteractiveSegmenterApp(QWidget):
                 )
                 
                 overlay_pixmap = QPixmap.fromImage(scaled_mask)
-                
-                current_pixmap = self.image_label.pixmap()
-                painter = QPainter(current_pixmap)
-                painter.setOpacity(0.5)
                 painter.drawPixmap(0, 0, overlay_pixmap)
-                painter.end()
                 
+                painter.end()
                 self.image_label.setPixmap(current_pixmap)
 
             except Exception as e:
@@ -235,25 +258,81 @@ class InteractiveSegmenterApp(QWidget):
         try:
             self.draw_prompts_overlay()
             
-            low_res_map_resized = cv2.resize(
-                low_res_map,
-                (self.original_w, self.original_h),
-                interpolation=cv2.INTER_NEAREST
-            )
-            
-            low_res_map_uint8 = (low_res_map_resized * 255).astype(np.uint8)
-            colormap = cv2.applyColorMap(low_res_map_uint8, cv2.COLORMAP_JET)
-            colormap_rgba = cv2.cvtColor(colormap, cv2.COLOR_BGR2RGBA)
-            
-            H, W, C = colormap_rgba.shape
-            q_image_mask = QImage(colormap_rgba.data, W, H, 4 * W, QImage.Format_RGBA8888)
-            overlay_pixmap = QPixmap.fromImage(q_image_mask)
-            
-            current_pixmap = self.image_label.pixmap()
-            painter = QPainter(current_pixmap)
-            painter.setOpacity(0.4) 
-            painter.drawPixmap(0, 0, overlay_pixmap)
-            painter.end()
+            # Handle crop vs pad differently
+            transform_info = getattr(self.segmenter, 'transform_info', {})
+            if transform_info.get("resize_method") == "crop":
+                
+                # For crop mode: only display hover overlay in the center cropped area
+                info = transform_info
+                crop_h, crop_w = info["crop_size_orig"]  # (height, width)
+                orig_w, orig_h = info["original_size"]   # (width, height)
+                
+                print(f"Original size: {orig_w}x{orig_h}, Crop size: {crop_w}x{crop_h}")
+                
+                # Resize low_res_map to the crop area size
+                low_res_map_resized = cv2.resize(
+                    low_res_map,
+                    (crop_w, crop_h),
+                    interpolation=cv2.INTER_NEAREST
+                )
+                
+                low_res_map_uint8 = (low_res_map_resized * 255).astype(np.uint8)
+                colormap = cv2.applyColorMap(low_res_map_uint8, cv2.COLORMAP_JET)
+                colormap_rgba = cv2.cvtColor(colormap, cv2.COLOR_BGR2RGBA)
+                
+                H, W, C = colormap_rgba.shape
+                q_image_mask = QImage(colormap_rgba.data, W, H, 4 * W, QImage.Format_RGBA8888)
+                
+                # Calculate crop area position in original coordinates
+                crop_y_start = (orig_h - crop_h) // 2
+                crop_x_start = (orig_w - crop_w) // 2
+                
+                # Since widget coordinates map directly to image pixels (no scaling in QLabel),
+                # the crop area coordinates are the same as in the original image
+                widget_crop_x = crop_x_start
+                widget_crop_y = crop_y_start
+                widget_crop_w = crop_w
+                widget_crop_h = crop_h
+                
+                print(f"Crop area: ({widget_crop_x}, {widget_crop_y}) size {widget_crop_w}x{widget_crop_h}")
+                
+                # Scale the colormap to the widget crop area size
+                scaled_mask = q_image_mask.scaled(
+                    widget_crop_w, widget_crop_h,
+                    Qt.IgnoreAspectRatio,
+                    Qt.FastTransformation
+                )
+                
+                overlay_pixmap = QPixmap.fromImage(scaled_mask)
+                
+                current_pixmap = self.image_label.pixmap()
+                painter = QPainter(current_pixmap)
+                painter.setOpacity(0.4)
+                # Draw overlay only in the crop area
+                painter.drawPixmap(widget_crop_x, widget_crop_y, overlay_pixmap)
+                painter.end()
+                
+            else:
+                # For pad mode: use original behavior (scale to entire image)
+                low_res_map_resized = cv2.resize(
+                    low_res_map,
+                    (self.original_w, self.original_h),
+                    interpolation=cv2.INTER_NEAREST
+                )
+                
+                low_res_map_uint8 = (low_res_map_resized * 255).astype(np.uint8)
+                colormap = cv2.applyColorMap(low_res_map_uint8, cv2.COLORMAP_JET)
+                colormap_rgba = cv2.cvtColor(colormap, cv2.COLOR_BGR2RGBA)
+                
+                H, W, C = colormap_rgba.shape
+                q_image_mask = QImage(colormap_rgba.data, W, H, 4 * W, QImage.Format_RGBA8888)
+                overlay_pixmap = QPixmap.fromImage(q_image_mask)
+                
+                current_pixmap = self.image_label.pixmap()
+                painter = QPainter(current_pixmap)
+                painter.setOpacity(0.4) 
+                painter.drawPixmap(0, 0, overlay_pixmap)
+                painter.end()
             
             self.image_label.setPixmap(current_pixmap)
 
@@ -311,7 +390,7 @@ class InteractiveSegmenterApp(QWidget):
     def handle_mouse_leave(self, event):
         self.last_hover_pos = None
         if not self.is_drawing:
-             self.draw_prompts_overlay() 
+            self.draw_prompts_overlay() 
 
     def update_sliders(self, value):
         """Called when the threshold slider moves."""
@@ -392,6 +471,13 @@ if __name__ == "__main__":
         choices=["faiss", "torch"],
         help="Segmentation method. 'faiss' is constant-time, 'torch' is brute-force."
     )
+    parser.add_argument(
+        "--resize-method",
+        type=str,
+        default="pad",
+        choices=["pad", "crop"],
+        help="Resize method. 'pad' adds padding to make image divisible by patch size, 'crop' center crops."
+    )
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
@@ -401,7 +487,8 @@ if __name__ == "__main__":
             args.folder, 
             max_res=args.resolution, 
             upsampler=args.upsampler,
-            segmenter=args.segmenter
+            segmenter=args.segmenter,
+            resize_method=args.resize_method
         )
         window.show()
         sys.exit(app.exec_())
@@ -412,4 +499,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         import traceback
-        traceback.print_exc()
+        traceback.print_exc() 
