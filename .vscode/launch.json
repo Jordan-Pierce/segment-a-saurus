@@ -11,7 +11,7 @@
             "program": "${workspaceFolder}/qtdemo_segmenter.py",
             "args": [
                 "--resolution", "448", 
-                "--upsampler", "bilinear",
+                "--upsampler", "anyup",
                 "--segmenter", "torch"
             ],
             "console": "integratedTerminal"
