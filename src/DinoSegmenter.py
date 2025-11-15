@@ -10,21 +10,24 @@ import time
 
 class DinoSegmenter:
     """
-    A class for high-resolution, interactive segmentation using
-    DINOv3, AnyUp, and real-time similarity search.
+    A class for high-resolution, interactive segmentation.
     
-    Processes the full image by resizing and padding, not cropping.
+    - Supports 'anyup' (high-quality) or 'bilinear' (fast) upsampling.
+    - Also stores the low-res patch similarity matrix for
+      fast, interactive "hover" previews.
     """
     
     def __init__(self, 
                  dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m", 
-                 device: str = None):
+                 device: str = None,
+                 upsampling_method: str = "anyup"):
         """
-        Initializes the segmenter by loading both DINOv3 and AnyUp models.
+        Initializes the segmenter.
         
         Args:
-            dino_model_name (str): The DINOv3 model to use as the feature extractor.
-            device (str, optional): The device to run models on ('cuda', 'cpu').
+            dino_model_name (str): The DINOv3 model to use.
+            device (str, optional): The device to run models on.
+            upsampling_method (str): 'anyup' or 'bilinear'.
         """
         print(f"Initializing DinoSegmenter with {dino_model_name}...")
         if device:
@@ -32,6 +35,10 @@ class DinoSegmenter:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
+        
+        self.upsampling_method = upsampling_method
+        if self.upsampling_method not in ["anyup", "bilinear"]:
+            raise ValueError("upsampling_method must be 'anyup' or 'bilinear'")
 
         self.is_vit = "vit" in dino_model_name.lower()
         attn_impl = "sdpa" if self.is_vit else "eager"
@@ -56,33 +63,32 @@ class DinoSegmenter:
             print(f"Error loading DINOv3 model: {e}")
             raise
 
-        # 2. Load AnyUp Model
-        try:
-            print("Loading AnyUp model from torch.hub...")
-            self.upsampler = torch.hub.load("wimmerth/anyup", "anyup", verbose=False).to(self.device).eval()
-        except Exception as e:
-            print(f"Error loading AnyUp model: {e}")
-            raise
+        # 2. Load AnyUp Model (Conditionally)
+        self.upsampler = None
+        if self.upsampling_method == "anyup":
+            try:
+                print("Loading AnyUp model from torch.hub...")
+                self.upsampler = torch.hub.load("wimmerth/anyup", "anyup", verbose=False).to(self.device).eval()
+            except Exception as e:
+                print(f"Error loading AnyUp model: {e}")
+                raise
+        else:
+            print("Using 'bilinear' upsampling. AnyUp model not loaded.")
         
-        # --- Initialize state for segmentation ---
-        self.hr_features = None # Will store the [C, H, W] pixel features
-        self.prompts = []       # Will store user clicks
-        self.transform_info = {} # Will store info to map clicks
+        # --- Initialize state ---
+        self.hr_features = None # High-res pixel features
+        self.prompts = []       # User clicks
+        self.transform_info = {} 
+        self.grid_size = None # (h, w) of patch grid
+        self.low_res_similarity_matrix = None # [N, N] patch similarity
             
         print("DinoSegmenter initialized successfully.")
 
     @torch.no_grad()
     def set_image(self, image: np.ndarray, target_res: int = 1024):
         """
-        Runs the full DINOv3 + AnyUp pipeline on an image and
-        stores the resulting high-resolution feature map.
-        
-        Image is resized (smallest edge to target_res) and then
-        padded to be divisible by the patch size.
-        
-        Args:
-            image (np.ndarray): The input image as an RGB numpy array [H, W, 3].
-            target_res (int): The resolution for the smallest edge.
+        Runs the full DINOv3 + (AnyUp or Bilinear) pipeline AND 
+        computes the low-res patch similarity matrix.
         """
         if not isinstance(image, np.ndarray):
             raise TypeError("Input image must be a numpy array.")
@@ -95,26 +101,21 @@ class DinoSegmenter:
         mean = self.processor.image_mean
         std = self.processor.image_std
         
-        # A. Transforms *before* padding
         transforms_pre = T.Compose([
             T.ToImage(),
             T.ToDtype(torch.float32, scale=True),
             T.Resize(size=target_res, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
         ])
         
-        # B. Apply pre-transforms to find unpadded size
         img_tensor_unpadded = transforms_pre(img_pil)
         _, H_proc_unpadded, W_proc_unpadded = img_tensor_unpadded.shape
         
-        # C. Calculate padding needed to be multiple of patch_size
         H_proc = (H_proc_unpadded + self.patch_size - 1) // self.patch_size * self.patch_size
         W_proc = (W_proc_unpadded + self.patch_size - 1) // self.patch_size * self.patch_size
         
         padding_right = W_proc - W_proc_unpadded
         padding_bottom = H_proc - H_proc_unpadded
         
-        # D. Create final transforms (pad and normalize)
-        # We pad with 0, which becomes (0-mean)/std after normalization
         transforms_post = T.Compose([
             T.Pad(padding=(0, 0, padding_right, padding_bottom), fill=0),
             T.Normalize(mean=mean, std=std),
@@ -122,11 +123,10 @@ class DinoSegmenter:
 
         # --- 2. Apply transforms ---
         hr_image_tensor_f32 = transforms_post(img_tensor_unpadded).to(self.device).unsqueeze(0)
-        B, C, H_proc_check, W_proc_check = hr_image_tensor_f32.shape
-        assert H_proc == H_proc_check and W_proc == W_proc_check
-
+        
         h_grid = H_proc // self.patch_size
         w_grid = W_proc // self.patch_size
+        self.grid_size = (h_grid, w_grid) # Store grid size
         n_patches = h_grid * w_grid
 
         # --- 3. DINOv3 Pass (Get Low-Res Features) ---
@@ -136,25 +136,43 @@ class DinoSegmenter:
         patch_features = hs.squeeze(0)[-n_patches:, :] 
         lr_features_f16 = patch_features.permute(1, 0).reshape(1, -1, h_grid, w_grid).contiguous()
 
-        # --- 4. AnyUp Pass (Get High-Res Features) ---
-        print("Running AnyUp pass...")
-        hr_features = self.upsampler(
-            hr_image_tensor_f32,
-            lr_features_f16.to(torch.float32),
-            q_chunk_size=256
-        )
+        # --- 4. Compute Low-Res Similarity Matrix (for hover) ---
+        print(f"Computing {n_patches}x{n_patches} low-res similarity matrix...")
+        patch_features_norm = F.normalize(patch_features, p=2, dim=1)
+        self.low_res_similarity_matrix = torch.matmul(patch_features_norm, patch_features_norm.T)
+        print("Low-res matrix computed.")
+
+        # --- 5. Upsampling Pass (Conditional) ---
+        if self.upsampling_method == "anyup":
+            print("Running AnyUp pass...")
+            if self.upsampler is None:
+                raise RuntimeError("Upsampling method is 'anyup' but AnyUp model was not loaded.")
+            hr_features = self.upsampler(
+                hr_image_tensor_f32,
+                lr_features_f16.to(torch.float32),
+                q_chunk_size=256
+            )
+        elif self.upsampling_method == "bilinear":
+            print("Running Bilinear upsampling pass...")
+            hr_features = F.interpolate(
+                lr_features_f16.to(torch.float32),
+                size=(H_proc, W_proc),
+                mode='bilinear',
+                align_corners=False
+            )
+        else:
+            raise ValueError(f"Unknown upsampling_method: {self.upsampling_method}")
         
-        # --- 5. Store state ---
+        # --- 6. Store state ---
         self.hr_features = hr_features.squeeze(0).permute(1, 2, 0) 
         self.prompts = []
         
-        # Store info needed to map clicks and un-pad the mask
         scale_factor = target_res / min(W_orig, H_orig)
         
         self.transform_info = {
             "original_size": (W_orig, H_orig),
-            "processed_size": (H_proc, W_proc), # Padded size
-            "unpadded_size": (H_proc_unpadded, W_proc_unpadded), # Resized-only size
+            "processed_size": (H_proc, W_proc), 
+            "unpadded_size": (H_proc_unpadded, W_proc_unpadded),
             "resize_scale": scale_factor,
         }
         
@@ -178,43 +196,54 @@ class DinoSegmenter:
         return max_similarity
 
     def _transform_coords(self, original_coords: tuple) -> tuple | None:
-        """Transforms (y, x) from original image to processed feature map."""
+        """Transforms (y, x) from original image to processed *pixel* map."""
         y_click, x_click = original_coords
         info = self.transform_info
         
-        # 1. Simulate the resize
         y_proc = int(y_click * info["resize_scale"])
         x_proc = int(x_click * info["resize_scale"])
         
-        # 2. Check if click is inside the un-padded area
         H_unpadded, W_unpadded = info["unpadded_size"]
         if 0 <= y_proc < H_unpadded and 0 <= x_proc < W_unpadded:
             return (y_proc, x_proc)
         else:
-            return None # Click was outside the processed area
+            return None 
+
+    def _transform_coords_to_patch(self, original_coords: tuple) -> int | None:
+        """Transforms (y, x) from original image to a flat *patch* index."""
+        processed_coords = self._transform_coords(original_coords)
+        
+        if processed_coords:
+            y_proc, x_proc = processed_coords
+            h_grid, w_grid = self.grid_size
+            
+            y_grid = y_proc // self.patch_size
+            x_grid = x_proc // self.patch_size
+            
+            patch_index = y_grid * w_grid + x_grid
+            n_patches = h_grid * w_grid
+            
+            if 0 <= patch_index < n_patches:
+                return patch_index
+        
+        return None
 
     # --- INTERACTIVE METHODS ---
 
     def add_prompt(self, original_coords: tuple, is_positive: bool):
-        """Adds a single point prompt (positive or negative) to the list."""
         processed_coords = self._transform_coords(original_coords)
         
         if processed_coords:
             label = 1 if is_positive else 0
             self.prompts.append({"coords": processed_coords, "label": label})
-            # Suppress print statements for drawing
-            # print(f"Added {'positive' if is_positive else 'negative'} prompt at {processed_coords}.")
         else:
-            # print("Click was outside the processed image area, prompt ignored.")
             pass
 
     def clear_prompts(self):
-        """Removes all active prompts."""
         self.prompts = []
         print("All prompts cleared.")
 
     def undo_prompt(self):
-        """Removes the most recently added prompt."""
         if self.prompts:
             removed = self.prompts.pop()
             print(f"Removed last prompt at {removed['coords']}.")
@@ -224,8 +253,7 @@ class DinoSegmenter:
     @torch.no_grad()
     def predict_scores(self) -> (np.ndarray, np.ndarray):
         """
-        Calculates the raw cosine similarity maps for positive and negative
-        prompts.
+        Calculates the HIGH-RES (pixel) similarity maps for clicks.
         """
         if self.hr_features is None:
             raise RuntimeError("An image must be set with set_image() before predicting.")
@@ -265,35 +293,54 @@ class DinoSegmenter:
         neg_map = neg_map_flat.reshape(H_proc, W_proc).cpu().numpy()
 
         return pos_map, neg_map
+
+    @torch.no_grad()
+    def get_low_res_similarity_map(self, original_coords: tuple) -> np.ndarray | None:
+        """
+        Gets a LOW-RES (patch) similarity map for hover.
+        This is an extremely fast lookup.
+        """
+        if self.low_res_similarity_matrix is None:
+            raise RuntimeError("An image must be set with set_image() before predicting.")
+            
+        patch_index = self._transform_coords_to_patch(original_coords)
+        
+        if patch_index is None:
+            return None
+        
+        scores = self.low_res_similarity_matrix[patch_index] 
+        
+        min_val, max_val = torch.min(scores), torch.max(scores)
+        if min_val == max_val:
+            normalized_scores = torch.ones_like(scores)
+        else:
+            normalized_scores = (scores - min_val) / (max_val - min_val + 1e-8)
+            
+        h, w = self.grid_size
+        return normalized_scores.reshape(h, w).cpu().numpy()
+
         
     def post_process_mask(self, confidence_map: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
         Aligns the processed confidence map with the original image.
-        
-        Takes the padded confidence_map, applies a threshold,
-        un-pads it, and then resizes it back to the original image's
-        dimensions.
+        Uses BICUBIC interpolation for smoother upscaling.
         """
         if self.transform_info is None:
             raise RuntimeError("set_image() must be called before post-processing.")
             
-        # 1. Apply threshold
         binary_mask = (confidence_map > threshold)
         
-        # 2. Get transform info
         info = self.transform_info
         W_orig, H_orig = info["original_size"]
         H_unpadded, W_unpadded = info["unpadded_size"]
         
-        # 3. Un-pad the mask by cropping it
         uncropped_mask = binary_mask[0:H_unpadded, 0:W_unpadded]
         
-        # 4. Resize this correctly-sized mask to the *original* image size
         mask_img = Image.fromarray((uncropped_mask * 255).astype(np.uint8))
-        mask_resized = np.array(mask_img.resize((W_orig, H_orig), Image.NEAREST))
         
-        # 5. Return as boolean
-        return (mask_resized > 0)
+        mask_resized = np.array(mask_img.resize((W_orig, H_orig), Image.BICUBIC))
+        
+        return (mask_resized > 128) 
 
 
 # (Main test function is disabled)

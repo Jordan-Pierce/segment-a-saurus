@@ -9,7 +9,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/qtdemo_segmenter.py",
-            "args": ["--resolution", "1024"],
+            "args": ["--resolution", "1024", "--upsampler", "bilinear"],
             "console": "integratedTerminal"
         }
     ]
