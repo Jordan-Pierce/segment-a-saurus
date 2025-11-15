@@ -236,9 +236,9 @@ class InteractiveSegmenterApp(QWidget):
             self.draw_prompts_overlay()
             
             low_res_map_resized = cv2.resize(
-                low_res_map.astype(np.float32),
+                low_res_map,
                 (self.original_w, self.original_h),
-                interpolation=cv2.INTER_LINEAR
+                interpolation=cv2.INTER_NEAREST
             )
             
             low_res_map_uint8 = (low_res_map_resized * 255).astype(np.uint8)

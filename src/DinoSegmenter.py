@@ -25,8 +25,8 @@ class DinoSegmenter:
     def __init__(self, 
                  dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m", 
                  device: str = None,
-                 upsampling_method: str = "anyup",
-                 segmenter_method: str = "faiss"): 
+                 upsampling_method: str = "bilinear",
+                 segmenter_method: str = "torch"): 
         
         print(f"Initializing DinoSegmenter with {dino_model_name}...")
         if device:
@@ -39,11 +39,14 @@ class DinoSegmenter:
         if self.upsampling_method not in ["anyup", "bilinear"]:
             raise ValueError("upsampling_method must be 'anyup' or 'bilinear'")
             
-        # --- NEW: Set segmenter method ---
         self.segmenter_method = segmenter_method
         if self.segmenter_method not in ["faiss", "torch"]:
             raise ValueError("segmenter_method must be 'faiss' or 'torch'")
         print(f"Using segmentation method: {self.segmenter_method}")
+
+        # --- Scale factor for medium-res bilinear ---
+        self.bilinear_med_res_scale = 6 
+        # (This means 4x the patch grid, e.g., 28x28 -> 112x112)
         # ---
 
         self.is_vit = "vit" in dino_model_name.lower()
@@ -52,7 +55,7 @@ class DinoSegmenter:
         # 1. Load DINOv3 Model
         try:
             print(f"Loading {dino_model_name}...")
-            self.processor = AutoImageProcessor.from_pretrained(dino_model_name)
+            self.processor = AutoImageProcessor.from_pretrained(dino_model_name, use_fast=True)
             self.model = AutoModel.from_pretrained(
                 dino_model_name,
                 dtype=torch.float16,
@@ -131,7 +134,7 @@ class DinoSegmenter:
         self.grid_size = (h_grid, w_grid) 
         n_patches = h_grid * w_grid
 
-        # --- 3. DINOv3 Pass (Get Low-Res Features) ---
+        # --- 3. DINOv3 Pass ---
         print("Running DINOv3 pass...")
         out = self.model(pixel_values=hr_image_tensor_f32.to(torch.float16))
         hs = out.last_hidden_state 
@@ -144,7 +147,7 @@ class DinoSegmenter:
         self.low_res_similarity_matrix = torch.matmul(patch_features_norm, patch_features_norm.T)
         print("Low-res matrix computed.")
 
-        # --- 5. Upsampling Pass (Conditional) ---
+        # --- 5. Upsampling Pass (MODIFIED) ---
         if self.upsampling_method == "anyup":
             print("Running AnyUp pass...")
             if self.upsampler is None:
@@ -155,16 +158,18 @@ class DinoSegmenter:
                 q_chunk_size=256
             )
         elif self.upsampling_method == "bilinear":
-            print("Running Bilinear upsampling pass...")
+            # --- NEW: Upsample to MEDIUM resolution, not full ---
+            med_res_size = (h_grid * self.bilinear_med_res_scale, w_grid * self.bilinear_med_res_scale)
+            print(f"Running Bilinear upsampling to medium-res: {med_res_size}...")
             hr_features = F.interpolate(
                 lr_features_f16.to(torch.float32),
-                size=(H_proc, W_proc),
+                size=med_res_size,
                 mode='bilinear',
                 align_corners=False
             )
         
         # --- 6. Store state ---
-        self.hr_features = hr_features.squeeze(0).permute(1, 2, 0) 
+        self.hr_features = hr_features.squeeze(0).permute(1, 2, 0).to(torch.float32) 
         self.prompts = []
         
         scale_factor = target_res / min(W_orig, H_orig)
@@ -196,35 +201,67 @@ class DinoSegmenter:
         return max_similarity
 
     def _transform_coords(self, original_coords: tuple) -> tuple | None:
-        """Transforms (y, x) from original image to processed *pixel* map."""
+        """
+        Transforms (y, x) from original image to processed feature map.
+        - 'anyup': returns (y, x) in PIXEL space.
+        - 'bilinear': returns (y_med, x_med) in MEDIUM-RES space.
+        """
         y_click, x_click = original_coords
         info = self.transform_info
         
+        # 1. Simulate the resize to get pixel coordinates
         y_proc = int(y_click * info["resize_scale"])
         x_proc = int(x_click * info["resize_scale"])
         
+        # 2. Check if click is inside the un-padded area
         H_unpadded, W_unpadded = info["unpadded_size"]
-        if 0 <= y_proc < H_unpadded and 0 <= x_proc < W_unpadded:
+        if not (0 <= y_proc < H_unpadded and 0 <= x_proc < W_unpadded):
+            return None # Click was outside the processed area
+            
+        # 3. Return coordinates based on method
+        if self.upsampling_method == 'anyup':
+            # AnyUp uses high-res pixel coordinates
             return (y_proc, x_proc)
         else:
-            return None 
+            # Bilinear uses medium-res coordinates
+            # We map the pixel coord (y_proc) to the medium-res grid
+            # (e.g., 448px -> 112px grid by dividing by 4 (patch_size/med_res_scale))
+            
+            # This is the scaling factor from pixel space to medium-res space
+            med_res_scale_factor = self.bilinear_med_res_scale / self.patch_size
+            
+            y_med = int(y_proc * med_res_scale_factor)
+            x_med = int(x_proc * med_res_scale_factor)
+            
+            return (y_med, x_med)
 
     def _transform_coords_to_patch(self, original_coords: tuple) -> int | None:
-        """Transforms (y, x) from original image to a flat *patch* index."""
-        processed_coords = self._transform_coords(original_coords)
+        """
+        Transforms (y, x) from original image to a flat *patch* index.
+        """
+        y_click, x_click = original_coords
+        info = self.transform_info
         
-        if processed_coords:
-            y_proc, x_proc = processed_coords
-            h_grid, w_grid = self.grid_size
+        # 1. Simulate the resize to get pixel coordinates
+        y_proc = int(y_click * info["resize_scale"])
+        x_proc = int(x_click * info["resize_scale"])
+        
+        # 2. Check if click is inside the un-padded area
+        H_unpadded, W_unpadded = info["unpadded_size"]
+        if not (0 <= y_proc < H_unpadded and 0 <= x_proc < W_unpadded):
+            return None # Click was outside the processed area
             
-            y_grid = y_proc // self.patch_size
-            x_grid = x_proc // self.patch_size
-            
-            patch_index = y_grid * w_grid + x_grid
-            n_patches = h_grid * w_grid
-            
-            if 0 <= patch_index < n_patches:
-                return patch_index
+        # 3. Convert pixel coordinates directly to grid coordinates
+        h_grid, w_grid = self.grid_size
+        
+        y_grid = y_proc // self.patch_size
+        x_grid = x_proc // self.patch_size
+        
+        patch_index = y_grid * w_grid + x_grid
+        n_patches = h_grid * w_grid
+        
+        if 0 <= patch_index < n_patches:
+            return patch_index
         
         return None
 
@@ -364,7 +401,10 @@ class DinoSegmenter:
     def post_process_mask(self, confidence_map: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
         Aligns the processed confidence map with the original image.
-        Uses BICUBIC interpolation for smoother upscaling.
+        - 'anyup': Un-pads a high-res pixel mask.
+        - 'bilinear': Un-pads a medium-res pixel mask.
+        
+        Both are upscaled with BICUBIC.
         """
         if self.transform_info is None:
             raise RuntimeError("set_image() must be called before post-processing.")
@@ -375,13 +415,26 @@ class DinoSegmenter:
         W_orig, H_orig = info["original_size"]
         H_unpadded, W_unpadded = info["unpadded_size"]
         
-        uncropped_mask = binary_mask[0:H_unpadded, 0:W_unpadded]
+        if self.upsampling_method == 'anyup':
+            # Un-pad the HIGH-RES pixel mask
+            uncropped_mask = binary_mask[0:H_unpadded, 0:W_unpadded]
         
+        else:
+            # Un-pad the MEDIUM-RES mask
+            # We must calculate the unpadded medium-res size
+            med_res_scale_factor = self.bilinear_med_res_scale / self.patch_size
+            H_unpadded_med = int(H_unpadded * med_res_scale_factor)
+            W_unpadded_med = int(W_unpadded * med_res_scale_factor)
+            
+            # Crop the medium-res mask
+            uncropped_mask = binary_mask[0:H_unpadded_med, 0:W_unpadded_med]
+        
+        # Now, upscale the (either high-res or med-res) uncropped mask
         mask_img = Image.fromarray((uncropped_mask * 255).astype(np.uint8))
         
         mask_resized = np.array(mask_img.resize((W_orig, H_orig), Image.BICUBIC))
         
-        return (mask_resized > 128) 
+        return (mask_resized > 128)
 
 
 # (Main test function is disabled)

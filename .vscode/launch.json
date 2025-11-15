@@ -10,8 +10,8 @@
             "request": "launch",
             "program": "${workspaceFolder}/qtdemo_segmenter.py",
             "args": [
-                "--resolution", "448", 
-                "--upsampler", "anyup",
+                "--resolution", "512", 
+                "--upsampler", "bilinear",
                 "--segmenter", "torch"
             ],
             "console": "integratedTerminal"
