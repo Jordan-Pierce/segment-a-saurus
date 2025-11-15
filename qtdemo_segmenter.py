@@ -54,6 +54,7 @@ class InteractiveSegmenterApp(QWidget):
     Wraps the DinoSegmenter for interactive segmentation.
     - HOVER (not drawing): Shows low-res patch similarity.
     - DRAG (drawing): Shows throttled high-res pixel segmentation (positive only).
+    - Uses a single "Threshold" slider for cutoff.
     """
 
     def __init__(self, 
@@ -87,14 +88,14 @@ class InteractiveSegmenterApp(QWidget):
 
         # --- State for drawing ---
         self.is_drawing = False
-        # self.draw_label is no longer needed
         self.move_event_counter = 0
         self.MOVE_EVENT_THRESHOLD = 3
         
         self.last_hover_pos = None
         self.threshold = 0.95
-        self.contrast = 10.0
-        self.app_prompts = [] # Stores dicts {"coords": (y,x)}
+        # --- Contrast is now a hard-coded constant ---
+        self.HARD_CONTRAST_VALUE = 50.0 
+        self.app_prompts = [] 
 
         self.init_ui()
 
@@ -105,7 +106,7 @@ class InteractiveSegmenterApp(QWidget):
         layout = QVBoxLayout()
         layout.addWidget(self.image_label)
 
-        # Sliders
+        # --- Simplified Sliders (Threshold only) ---
         threshold_layout = QHBoxLayout()
         self.threshold_slider = QSlider(Qt.Horizontal)
         self.threshold_slider.setMinimum(0); self.threshold_slider.setMaximum(100)
@@ -113,21 +114,11 @@ class InteractiveSegmenterApp(QWidget):
         self.threshold_slider.valueChanged.connect(self.update_sliders)
         self.threshold_value_label = QLabelWidget(f"{self.threshold:.2f}")
         threshold_layout.addLayout(self.create_slider_layout(
-            "Threshold (Cutoff):", self.threshold_slider, self.threshold_value_label
-        ))
-        
-        contrast_layout = QHBoxLayout()
-        self.contrast_slider = QSlider(Qt.Horizontal)
-        self.contrast_slider.setMinimum(1); self.contrast_slider.setMaximum(50)
-        self.contrast_slider.setValue(int(self.contrast))
-        self.contrast_slider.valueChanged.connect(self.update_sliders)
-        self.contrast_value_label = QLabelWidget(f"{self.contrast:.1f}")
-        contrast_layout.addLayout(self.create_slider_layout(
-            "Contrast (Steepness):", self.contrast_slider, self.contrast_value_label
+            "Threshold:", self.threshold_slider, self.threshold_value_label
         ))
         
         layout.addLayout(threshold_layout)
-        layout.addLayout(contrast_layout)
+        # --- Contrast Slider Removed ---
 
         # Buttons
         button_layout = QHBoxLayout()
@@ -162,7 +153,6 @@ class InteractiveSegmenterApp(QWidget):
         self.original_h, self.original_w = self.image_rgb.shape[:2]
         self.display_image = self.image_rgb.copy()
         
-        # Update window title
         base_title = self.windowTitle().split(" - ")[0] 
         self.setWindowTitle(
             f"{base_title} - {os.path.basename(self.image_path)} "
@@ -170,13 +160,10 @@ class InteractiveSegmenterApp(QWidget):
         )
         
     def draw_prompts_overlay(self):
-        """
-        FAST update. Only draws the base image and the (green) prompt circles.
-        """
         self.display_image = self.image_rgb.copy()
         temp_rgb = cv2.cvtColor(self.display_image, cv2.COLOR_RGBA2RGB)
         
-        color = (0, 255, 0) # All prompts are positive
+        color = (0, 255, 0) 
         for prompt in self.app_prompts:
             y, x = prompt['coords']
             cv2.circle(temp_rgb, (x, y), 5, color, -1)
@@ -192,20 +179,18 @@ class InteractiveSegmenterApp(QWidget):
     def update_mask(self):
         """
         SLOW update. Runs high-res segmentation and overlays the mask.
-        (Simplified: no negative map)
+        (Simplified: no negative map, fixed contrast)
         """
         if self.segmenter.prompts:
             try:
-                # --- SIMPLIFIED: Only get positive map ---
                 pos_map = self.segmenter.predict_scores()
 
                 device = self.segmenter.device
                 pos_map_torch = torch.from_numpy(pos_map).to(device)
 
-                # --- SIMPLIFIED: Only apply sigmoid to positive map ---
-                pos_conf = 1.0 / (1.0 + torch.exp(-self.contrast * (pos_map_torch - self.threshold)))
+                # --- SIMPLIFIED: Use hard-coded contrast value ---
+                pos_conf = 1.0 / (1.0 + torch.exp(-self.HARD_CONTRAST_VALUE * (pos_map_torch - self.threshold)))
                 
-                # --- SIMPLIFIED: No subtraction ---
                 confidence_map_torch = torch.clamp(pos_conf, min=0.0, max=1.0)
                 
                 confidence_map = confidence_map_torch.cpu().numpy()
@@ -239,10 +224,6 @@ class InteractiveSegmenterApp(QWidget):
                 print(f"Error during mask overlay: {e}")
 
     def draw_hover_overlay(self, low_res_map: np.ndarray):
-        """
-        FAST update. Draws a blocky, colored, low-res
-        similarity map for hover feedback.
-        """
         try:
             self.draw_prompts_overlay()
             
@@ -253,7 +234,7 @@ class InteractiveSegmenterApp(QWidget):
             )
             
             low_res_map_uint8 = (low_res_map_resized * 255).astype(np.uint8)
-            colormap = cv2.applyColorMap(low_res_map_uint8, cv2.COLORMAP_INFERNO)
+            colormap = cv2.applyColorMap(low_res_map_uint8, cv2.COLORMAP_JET)
             colormap_rgba = cv2.cvtColor(colormap, cv2.COLOR_BGR2RGBA)
             
             H, W, C = colormap_rgba.shape
@@ -272,22 +253,18 @@ class InteractiveSegmenterApp(QWidget):
             print(f"Error during hover overlay: {e}")
 
     def add_point_at_event(self, event):
-        """Helper to add a positive prompt and draw the visual feedback."""
         x = event.x()
         y = event.y()
         
         y = max(0, min(y, self.original_h - 1))
         x = max(0, min(x, self.original_w - 1))
 
-        # --- SIMPLIFIED: No label needed ---
         self.app_prompts.append({'coords': (y, x)})
         self.segmenter.add_prompt((y, x))
         
         self.draw_prompts_overlay()
 
     def handle_mouse_down(self, event):
-        """Starts a drawing session (positive only)."""
-        # --- SIMPLIFIED: Only allow left-click drawing ---
         if event.button() == Qt.LeftButton:
             self.is_drawing = True
             self.last_hover_pos = None 
@@ -298,17 +275,13 @@ class InteractiveSegmenterApp(QWidget):
             self.is_drawing = False
 
     def handle_mouse_move(self, event):
-        """Handles both drawing (drag) and hover (move)."""
-        
         if self.is_drawing:
-            # --- We are DRAGGING ---
             self.add_point_at_event(event) 
             self.move_event_counter += 1
             if self.move_event_counter % self.MOVE_EVENT_THRESHOLD == 0:
                 self.update_mask()
         
         else:
-            # --- We are just HOVERING ---
             pos = (event.x(), event.y())
             if pos == self.last_hover_pos:
                 return 
@@ -321,7 +294,6 @@ class InteractiveSegmenterApp(QWidget):
                 self.draw_hover_overlay(low_res_map)
             
     def handle_mouse_release(self, event):
-        """Ends a drawing session and triggers a final segmentation."""
         if self.is_drawing:
             self.is_drawing = False
             self.move_event_counter = 0 
@@ -329,24 +301,21 @@ class InteractiveSegmenterApp(QWidget):
             self.update_mask() 
             
     def handle_mouse_leave(self, event):
-        """Clears the hover overlay when the mouse leaves the widget."""
         self.last_hover_pos = None
         if not self.is_drawing:
              self.draw_prompts_overlay() 
 
     def update_sliders(self, value):
-        """Called when either slider moves. Triggers a full mask update."""
+        """Called when the threshold slider moves."""
         self.threshold = self.threshold_slider.value() / 100.0
         self.threshold_value_label.setText(f"{self.threshold:.2f}")
 
-        self.contrast = self.contrast_slider.value()
-        self.contrast_value_label.setText(f"{self.contrast:.1f}")
+        # --- Contrast update removed ---
 
         self.draw_prompts_overlay() 
         self.update_mask()          
 
     def update_display_full(self):
-        """Helper to do a full-refresh (prompts + mask)."""
         self.draw_prompts_overlay()
         self.update_mask()
 

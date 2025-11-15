@@ -19,7 +19,7 @@ class DinoSegmenter:
     """
     
     def __init__(self, 
-                 dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m", 
+                 dino_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m", 
                  device: str = None,
                  upsampling_method: str = "anyup"):
         
