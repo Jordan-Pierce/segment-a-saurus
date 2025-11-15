@@ -1,11 +1,15 @@
-import torch
-import torch.nn.functional as F
+import time
+
 import numpy as np
 from PIL import Image
-from transformers import AutoImageProcessor, AutoModel
+
+import torch
+import torch.nn.functional as F
 import torchvision.transforms.v2 as T 
-import matplotlib.pyplot as plt
-import time
+
+from transformers import AutoImageProcessor, AutoModel
+
+import faiss
 
 
 class DinoSegmenter:
@@ -19,9 +23,10 @@ class DinoSegmenter:
     """
     
     def __init__(self, 
-                 dino_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m", 
+                 dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m", 
                  device: str = None,
-                 upsampling_method: str = "anyup"):
+                 upsampling_method: str = "anyup",
+                 segmenter_method: str = "faiss"): 
         
         print(f"Initializing DinoSegmenter with {dino_model_name}...")
         if device:
@@ -33,6 +38,13 @@ class DinoSegmenter:
         self.upsampling_method = upsampling_method
         if self.upsampling_method not in ["anyup", "bilinear"]:
             raise ValueError("upsampling_method must be 'anyup' or 'bilinear'")
+            
+        # --- NEW: Set segmenter method ---
+        self.segmenter_method = segmenter_method
+        if self.segmenter_method not in ["faiss", "torch"]:
+            raise ValueError("segmenter_method must be 'faiss' or 'torch'")
+        print(f"Using segmentation method: {self.segmenter_method}")
+        # ---
 
         self.is_vit = "vit" in dino_model_name.lower()
         attn_impl = "sdpa" if self.is_vit else "eager"
@@ -43,7 +55,7 @@ class DinoSegmenter:
             self.processor = AutoImageProcessor.from_pretrained(dino_model_name)
             self.model = AutoModel.from_pretrained(
                 dino_model_name,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,
                 device_map="auto",
                 attn_implementation=attn_impl,
             ).to(self.device).eval()
@@ -71,7 +83,7 @@ class DinoSegmenter:
         
         # --- Initialize state ---
         self.hr_features = None 
-        self.prompts = [] # Stores coordinates only
+        self.prompts = [] 
         self.transform_info = {} 
         self.grid_size = None 
         self.low_res_similarity_matrix = None 
@@ -241,10 +253,21 @@ class DinoSegmenter:
     @torch.no_grad()
     def predict_scores(self) -> np.ndarray:
         """
-        Calculates the HIGH-RES (pixel) similarity map for positive clicks.
-        Returns:
-            np.ndarray: pos_map: [H_proc, W_proc] map of positive similarities (0 to 1).
+        Calls the correct segmentation method based on the
+        segmenter_method set during initialization.
         """
+        if self.segmenter_method == "faiss":
+            return self.predict_scores_faiss()
+        else: # "torch"
+            return self.predict_scores_torch()
+
+    @torch.no_grad()
+    def predict_scores_torch(self) -> np.ndarray:
+        """
+        Calculates the HIGH-RES (pixel) similarity map using torch.matmul.
+        Speed is PROPORTIONAL to the number of prompts.
+        """
+        t0 = time.time()
         if self.hr_features is None:
             raise RuntimeError("An image must be set with set_image() before predicting.")
 
@@ -252,26 +275,66 @@ class DinoSegmenter:
         all_features = self.hr_features.reshape(-1, C)
 
         if len(self.prompts) == 0:
-            print("No prompts provided. Returning empty map.")
             return np.zeros((H_proc, W_proc), dtype=np.float32)
 
-        # 1. Collect positive prompt features
         pos_features = []
         for prompt in self.prompts:
             y, x = prompt['coords']
             pos_features.append(self.hr_features[y, x])
 
-        # 2. Calculate positive similarity map
         if pos_features:
             pos_map_flat = self._calculate_similarity(all_features, pos_features)
-            # Normalize from -1 to 1 (raw similarity) to 0 to 1
             pos_map_flat = (pos_map_flat + 1.0) / 2.0
         else:
             pos_map_flat = torch.zeros(H_proc * W_proc, device=self.device)
-
-        # 4. Reshape and return as numpy array
+        
         pos_map = pos_map_flat.reshape(H_proc, W_proc).cpu().numpy()
+        
+        print(f"[torch] _calculate_similarity took {time.time() - t0:.4f}s")
         return pos_map
+
+    @torch.no_grad()
+    def predict_scores_faiss(self) -> np.ndarray:
+        """
+        Calculates the HIGH-RES (pixel) similarity map using Faiss.
+        Speed is CONSTANT regardless of the number of prompts.
+        """
+        t0 = time.time()
+        if self.hr_features is None:
+            raise RuntimeError("An image must be set with set_image() before predicting.")
+
+        H_proc, W_proc, C = self.hr_features.shape
+        
+        if len(self.prompts) == 0:
+            return np.zeros((H_proc, W_proc), dtype=np.float32)
+
+        pos_features = []
+        for prompt in self.prompts:
+            y, x = prompt['coords']
+            pos_features.append(self.hr_features[y, x])
+            
+        if not pos_features:
+             return np.zeros((H_proc, W_proc), dtype=np.float32)
+
+        all_features_flat = self.hr_features.reshape(-1, C)
+        prompt_features = torch.stack(pos_features)
+        
+        all_features_norm = F.normalize(all_features_flat, p=2, dim=1)
+        prompt_features_norm = F.normalize(prompt_features, p=2, dim=1)
+        
+        all_features_np = all_features_norm.cpu().numpy().astype('float32')
+        prompt_features_np = prompt_features_norm.cpu().numpy().astype('float32')
+        
+        index = faiss.IndexFlatIP(C)
+        index.add(prompt_features_np) 
+        
+        D, I = index.search(all_features_np, k=1)
+        
+        pos_map_flat = (D.squeeze() + 1.0) / 2.0
+        
+        print(f"[faiss] index build + search took {time.time() - t0:.4f}s")
+        
+        return pos_map_flat.reshape(H_proc, W_proc).astype(np.float32)
 
     @torch.no_grad()
     def get_low_res_similarity_map(self, original_coords: tuple) -> np.ndarray | None:
@@ -298,7 +361,6 @@ class DinoSegmenter:
         h, w = self.grid_size
         return normalized_scores.reshape(h, w).cpu().numpy()
 
-        
     def post_process_mask(self, confidence_map: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
         Aligns the processed confidence map with the original image.

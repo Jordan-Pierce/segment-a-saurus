@@ -1,6 +1,7 @@
 import os
 import sys
 import glob
+import time
 import argparse
 
 import cv2
@@ -60,7 +61,8 @@ class InteractiveSegmenterApp(QWidget):
     def __init__(self, 
                  folder_path: str, 
                  max_res: int = 1024, 
-                 upsampler: str = "anyup"):
+                 upsampler: str = "anyup",
+                 segmenter: str = "faiss"):
         super().__init__()
         
         self.max_res = max_res
@@ -74,7 +76,8 @@ class InteractiveSegmenterApp(QWidget):
         self.load_image(self.current_index)
 
         try:
-            self.segmenter = DinoSegmenter(upsampling_method=upsampler)
+            self.segmenter = DinoSegmenter(upsampling_method=upsampler, 
+                                           segmenter_method=segmenter)
         except Exception as e:
             print(f"Fatal error: Could not initialize DinoSegmenter. Error: {e}")
             sys.exit(1)
@@ -183,7 +186,12 @@ class InteractiveSegmenterApp(QWidget):
         """
         if self.segmenter.prompts:
             try:
+                
+                t0 = time.time()
                 pos_map = self.segmenter.predict_scores()
+                t1 = time.time()
+                print(f"[{self.segmenter.segmenter_method}] "
+                      f"predict_scores took: {t1-t0:.4f}s for {len(self.segmenter.prompts)} prompts")
 
                 device = self.segmenter.device
                 pos_map_torch = torch.from_numpy(pos_map).to(device)
@@ -373,9 +381,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--upsampler",
         type=str,
-        default="anyup",
+        default="bilinear",
         choices=["anyup", "bilinear"],
         help="The method to use for upsampling DINO features. 'anyup' is high quality, 'bilinear' is fast."
+    )
+    parser.add_argument(
+        "--segmenter",
+        type=str,
+        default="faiss",
+        choices=["faiss", "torch"],
+        help="Segmentation method. 'faiss' is constant-time, 'torch' is brute-force."
     )
     args = parser.parse_args()
 
@@ -385,7 +400,8 @@ if __name__ == "__main__":
         window = InteractiveSegmenterApp(
             args.folder, 
             max_res=args.resolution, 
-            upsampler=args.upsampler
+            upsampler=args.upsampler,
+            segmenter=args.segmenter
         )
         window.show()
         sys.exit(app.exec_())

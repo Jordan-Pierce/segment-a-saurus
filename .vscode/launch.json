@@ -9,7 +9,11 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/qtdemo_segmenter.py",
-            "args": ["--resolution", "512", "--upsampler", "anyup"],
+            "args": [
+                "--resolution", "448", 
+                "--upsampler", "bilinear",
+                "--segmenter", "torch"
+            ],
             "console": "integratedTerminal"
         }
     ]
