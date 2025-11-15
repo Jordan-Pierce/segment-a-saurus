@@ -44,11 +44,6 @@ class DinoSegmenter:
             raise ValueError("segmenter_method must be 'faiss' or 'torch'")
         print(f"Using segmentation method: {self.segmenter_method}")
 
-        # --- Scale factor for medium-res bilinear ---
-        self.bilinear_med_res_scale = 6 
-        # (This means 4x the patch grid, e.g., 28x28 -> 112x112)
-        # ---
-
         self.is_vit = "vit" in dino_model_name.lower()
         attn_impl = "sdpa" if self.is_vit else "eager"
 
@@ -71,6 +66,11 @@ class DinoSegmenter:
         except Exception as e:
             print(f"Error loading DINOv3 model: {e}")
             raise
+        
+        # --- Scale factor for medium-res bilinear ---
+        self.bilinear_med_res_scale = self.patch_size // 4 
+        # (This means 4x the patch grid, e.g., 28x28 -> 112x112)
+        # ---
 
         # 2. Load AnyUp Model (Conditionally)
         self.upsampler = None
@@ -349,6 +349,13 @@ class DinoSegmenter:
         for prompt in self.prompts:
             y, x = prompt['coords']
             pos_features.append(self.hr_features[y, x])
+            
+        # pos_features = []
+        # if self.prompts:  # Make sure list isn't empty
+        #     # Only get the very last point the user added
+        #     prompt = self.prompts[-1] 
+        #     y, x = prompt['coords']
+        #     pos_features.append(self.hr_features[y, x])
             
         if not pos_features:
              return np.zeros((H_proc, W_proc), dtype=np.float32)

@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/qtdemo_segmenter.py",
             "args": [
-                "--resolution", "512", 
+                "--resolution", "1024", 
                 "--upsampler", "bilinear",
                 "--segmenter", "torch"
             ],
