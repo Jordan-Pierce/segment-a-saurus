@@ -155,7 +155,7 @@ class DinoSegmenter:
             hr_features = self.upsampler(
                 hr_image_tensor_f32,
                 lr_features_f16.to(torch.float32),
-                q_chunk_size=256
+                q_chunk_size=1024
             )
         elif self.upsampling_method == "bilinear":
             # --- NEW: Upsample to MEDIUM resolution, not full ---
