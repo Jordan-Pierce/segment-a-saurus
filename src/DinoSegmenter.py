@@ -146,7 +146,7 @@ class DinoSegmenter:
         patch_features_norm = F.normalize(patch_features, p=2, dim=1)
         self.low_res_similarity_matrix = torch.matmul(patch_features_norm, patch_features_norm.T)
         print("Low-res matrix computed.")
-
+        
         # --- 5. Upsampling Pass (MODIFIED) ---
         if self.upsampling_method == "anyup":
             print("Running AnyUp pass...")
@@ -358,7 +358,7 @@ class DinoSegmenter:
         #     pos_features.append(self.hr_features[y, x])
             
         if not pos_features:
-             return np.zeros((H_proc, W_proc), dtype=np.float32)
+            return np.zeros((H_proc, W_proc), dtype=np.float32)
 
         all_features_flat = self.hr_features.reshape(-1, C)
         prompt_features = torch.stack(pos_features)
