@@ -53,10 +53,9 @@ class InteractiveSegmenterApp(QWidget):
     """
     Wraps the DinoSegmenter for interactive segmentation.
     - HOVER (not drawing): Shows low-res patch similarity.
-    - DRAG (drawing): Shows throttled high-res pixel segmentation.
+    - DRAG (drawing): Shows throttled high-res pixel segmentation (positive only).
     """
 
-    # --- MODIFIED __init__ ---
     def __init__(self, 
                  folder_path: str, 
                  max_res: int = 1024, 
@@ -74,13 +73,11 @@ class InteractiveSegmenterApp(QWidget):
         self.load_image(self.current_index)
 
         try:
-            # --- Pass upsampler arg to constructor ---
             self.segmenter = DinoSegmenter(upsampling_method=upsampler)
         except Exception as e:
             print(f"Fatal error: Could not initialize DinoSegmenter. Error: {e}")
             sys.exit(1)
         
-        # --- Set window title based on upsampler ---
         title = f"DINOv3 Segmentation ({upsampler.upper()}) - PyQt5 Demo"
         self.setWindowTitle(title)
 
@@ -90,14 +87,14 @@ class InteractiveSegmenterApp(QWidget):
 
         # --- State for drawing ---
         self.is_drawing = False
-        self.draw_label = 1  
+        # self.draw_label is no longer needed
         self.move_event_counter = 0
         self.MOVE_EVENT_THRESHOLD = 3
         
         self.last_hover_pos = None
         self.threshold = 0.95
         self.contrast = 10.0
-        self.app_prompts = []
+        self.app_prompts = [] # Stores dicts {"coords": (y,x)}
 
         self.init_ui()
 
@@ -166,19 +163,22 @@ class InteractiveSegmenterApp(QWidget):
         self.display_image = self.image_rgb.copy()
         
         # Update window title
-        base_title = self.windowTitle().split(" - ")[0] # Get base title
+        base_title = self.windowTitle().split(" - ")[0] 
         self.setWindowTitle(
             f"{base_title} - {os.path.basename(self.image_path)} "
-            "(Hover: low-res, Drag Left/Right: high-res)"
+            "(Hover: low-res, Drag Left: high-res)"
         )
         
     def draw_prompts_overlay(self):
+        """
+        FAST update. Only draws the base image and the (green) prompt circles.
+        """
         self.display_image = self.image_rgb.copy()
         temp_rgb = cv2.cvtColor(self.display_image, cv2.COLOR_RGBA2RGB)
         
+        color = (0, 255, 0) # All prompts are positive
         for prompt in self.app_prompts:
             y, x = prompt['coords']
-            color = (0, 255, 0) if prompt['label'] == 1 else (255, 0, 0)
             cv2.circle(temp_rgb, (x, y), 5, color, -1)
         
         self.display_image = cv2.cvtColor(temp_rgb, cv2.COLOR_RGB2RGBA)
@@ -190,24 +190,30 @@ class InteractiveSegmenterApp(QWidget):
         self.image_label.setPixmap(current_pixmap)
 
     def update_mask(self):
+        """
+        SLOW update. Runs high-res segmentation and overlays the mask.
+        (Simplified: no negative map)
+        """
         if self.segmenter.prompts:
             try:
-                pos_map, neg_map = self.segmenter.predict_scores()
+                # --- SIMPLIFIED: Only get positive map ---
+                pos_map = self.segmenter.predict_scores()
 
                 device = self.segmenter.device
                 pos_map_torch = torch.from_numpy(pos_map).to(device)
-                neg_map_torch = torch.from_numpy(neg_map).to(device)
 
+                # --- SIMPLIFIED: Only apply sigmoid to positive map ---
                 pos_conf = 1.0 / (1.0 + torch.exp(-self.contrast * (pos_map_torch - self.threshold)))
-                neg_conf = 1.0 / (1.0 + torch.exp(-self.contrast * (neg_map_torch - self.threshold)))
-
-                confidence_map_torch = torch.clamp(pos_conf - neg_conf, min=0.0, max=1.0)
+                
+                # --- SIMPLIFIED: No subtraction ---
+                confidence_map_torch = torch.clamp(pos_conf, min=0.0, max=1.0)
                 
                 confidence_map = confidence_map_torch.cpu().numpy()
                 final_mask = self.segmenter.post_process_mask(
                     confidence_map, threshold=0.5
                 )
 
+                # --- Overlay the mask ---
                 mask_uint8 = (final_mask * 255).astype(np.uint8)
                 H, W = final_mask.shape
                 q_image_mask = QImage(mask_uint8.data, W, H, W, QImage.Format_Grayscale8)
@@ -233,6 +239,10 @@ class InteractiveSegmenterApp(QWidget):
                 print(f"Error during mask overlay: {e}")
 
     def draw_hover_overlay(self, low_res_map: np.ndarray):
+        """
+        FAST update. Draws a blocky, colored, low-res
+        similarity map for hover feedback.
+        """
         try:
             self.draw_prompts_overlay()
             
@@ -262,40 +272,43 @@ class InteractiveSegmenterApp(QWidget):
             print(f"Error during hover overlay: {e}")
 
     def add_point_at_event(self, event):
+        """Helper to add a positive prompt and draw the visual feedback."""
         x = event.x()
         y = event.y()
         
         y = max(0, min(y, self.original_h - 1))
         x = max(0, min(x, self.original_w - 1))
 
-        self.app_prompts.append({'coords': (y, x), 'label': self.draw_label})
-        self.segmenter.add_prompt((y, x), is_positive=(self.draw_label == 1))
+        # --- SIMPLIFIED: No label needed ---
+        self.app_prompts.append({'coords': (y, x)})
+        self.segmenter.add_prompt((y, x))
         
         self.draw_prompts_overlay()
 
     def handle_mouse_down(self, event):
-        self.is_drawing = True
-        self.last_hover_pos = None 
-        
+        """Starts a drawing session (positive only)."""
+        # --- SIMPLIFIED: Only allow left-click drawing ---
         if event.button() == Qt.LeftButton:
-            self.draw_label = 1
-        elif event.button() == Qt.RightButton:
-            self.draw_label = 0
+            self.is_drawing = True
+            self.last_hover_pos = None 
+            
+            self.add_point_at_event(event)
+            self.update_mask() 
         else:
             self.is_drawing = False
-            return
-            
-        self.add_point_at_event(event)
-        self.update_mask() 
 
     def handle_mouse_move(self, event):
+        """Handles both drawing (drag) and hover (move)."""
+        
         if self.is_drawing:
+            # --- We are DRAGGING ---
             self.add_point_at_event(event) 
             self.move_event_counter += 1
             if self.move_event_counter % self.MOVE_EVENT_THRESHOLD == 0:
                 self.update_mask()
         
         else:
+            # --- We are just HOVERING ---
             pos = (event.x(), event.y())
             if pos == self.last_hover_pos:
                 return 
@@ -308,6 +321,7 @@ class InteractiveSegmenterApp(QWidget):
                 self.draw_hover_overlay(low_res_map)
             
     def handle_mouse_release(self, event):
+        """Ends a drawing session and triggers a final segmentation."""
         if self.is_drawing:
             self.is_drawing = False
             self.move_event_counter = 0 
@@ -315,11 +329,13 @@ class InteractiveSegmenterApp(QWidget):
             self.update_mask() 
             
     def handle_mouse_leave(self, event):
+        """Clears the hover overlay when the mouse leaves the widget."""
         self.last_hover_pos = None
         if not self.is_drawing:
              self.draw_prompts_overlay() 
 
     def update_sliders(self, value):
+        """Called when either slider moves. Triggers a full mask update."""
         self.threshold = self.threshold_slider.value() / 100.0
         self.threshold_value_label.setText(f"{self.threshold:.2f}")
 
@@ -330,6 +346,7 @@ class InteractiveSegmenterApp(QWidget):
         self.update_mask()          
 
     def update_display_full(self):
+        """Helper to do a full-refresh (prompts + mask)."""
         self.draw_prompts_overlay()
         self.update_mask()
 
@@ -369,7 +386,6 @@ class InteractiveSegmenterApp(QWidget):
             self.close()
 
 
-# --- MODIFIED __main__ ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Interactive DINOv3 Segmentation Tool with PyQt5"
@@ -385,7 +401,6 @@ if __name__ == "__main__":
         default=448,
         help="Target resolution for the smallest edge. Smaller is faster."
     )
-    # --- NEW ARGUMENT ---
     parser.add_argument(
         "--upsampler",
         type=str,
@@ -398,7 +413,6 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     try:
-        # --- Pass new argument to constructor ---
         window = InteractiveSegmenterApp(
             args.folder, 
             max_res=args.resolution, 

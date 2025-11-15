@@ -15,20 +15,14 @@ class DinoSegmenter:
     - Supports 'anyup' (high-quality) or 'bilinear' (fast) upsampling.
     - Also stores the low-res patch similarity matrix for
       fast, interactive "hover" previews.
+    - Only supports positive (additive) prompts.
     """
     
     def __init__(self, 
                  dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m", 
                  device: str = None,
                  upsampling_method: str = "anyup"):
-        """
-        Initializes the segmenter.
         
-        Args:
-            dino_model_name (str): The DINOv3 model to use.
-            device (str, optional): The device to run models on.
-            upsampling_method (str): 'anyup' or 'bilinear'.
-        """
         print(f"Initializing DinoSegmenter with {dino_model_name}...")
         if device:
             self.device = torch.device(device)
@@ -76,20 +70,16 @@ class DinoSegmenter:
             print("Using 'bilinear' upsampling. AnyUp model not loaded.")
         
         # --- Initialize state ---
-        self.hr_features = None # High-res pixel features
-        self.prompts = []       # User clicks
+        self.hr_features = None 
+        self.prompts = [] # Stores coordinates only
         self.transform_info = {} 
-        self.grid_size = None # (h, w) of patch grid
-        self.low_res_similarity_matrix = None # [N, N] patch similarity
+        self.grid_size = None 
+        self.low_res_similarity_matrix = None 
             
         print("DinoSegmenter initialized successfully.")
 
     @torch.no_grad()
     def set_image(self, image: np.ndarray, target_res: int = 1024):
-        """
-        Runs the full DINOv3 + (AnyUp or Bilinear) pipeline AND 
-        computes the low-res patch similarity matrix.
-        """
         if not isinstance(image, np.ndarray):
             raise TypeError("Input image must be a numpy array.")
 
@@ -126,7 +116,7 @@ class DinoSegmenter:
         
         h_grid = H_proc // self.patch_size
         w_grid = W_proc // self.patch_size
-        self.grid_size = (h_grid, w_grid) # Store grid size
+        self.grid_size = (h_grid, w_grid) 
         n_patches = h_grid * w_grid
 
         # --- 3. DINOv3 Pass (Get Low-Res Features) ---
@@ -160,8 +150,6 @@ class DinoSegmenter:
                 mode='bilinear',
                 align_corners=False
             )
-        else:
-            raise ValueError(f"Unknown upsampling_method: {self.upsampling_method}")
         
         # --- 6. Store state ---
         self.hr_features = hr_features.squeeze(0).permute(1, 2, 0) 
@@ -228,14 +216,14 @@ class DinoSegmenter:
         
         return None
 
-    # --- INTERACTIVE METHODS ---
+    # --- INTERACTIVE METHODS (SIMPLIFIED) ---
 
-    def add_prompt(self, original_coords: tuple, is_positive: bool):
+    def add_prompt(self, original_coords: tuple):
+        """Adds a single positive point prompt to the list."""
         processed_coords = self._transform_coords(original_coords)
         
         if processed_coords:
-            label = 1 if is_positive else 0
-            self.prompts.append({"coords": processed_coords, "label": label})
+            self.prompts.append({"coords": processed_coords})
         else:
             pass
 
@@ -251,9 +239,11 @@ class DinoSegmenter:
             print("No prompts to undo.")
 
     @torch.no_grad()
-    def predict_scores(self) -> (np.ndarray, np.ndarray):
+    def predict_scores(self) -> np.ndarray:
         """
-        Calculates the HIGH-RES (pixel) similarity maps for clicks.
+        Calculates the HIGH-RES (pixel) similarity map for positive clicks.
+        Returns:
+            np.ndarray: pos_map: [H_proc, W_proc] map of positive similarities (0 to 1).
         """
         if self.hr_features is None:
             raise RuntimeError("An image must be set with set_image() before predicting.")
@@ -262,37 +252,26 @@ class DinoSegmenter:
         all_features = self.hr_features.reshape(-1, C)
 
         if len(self.prompts) == 0:
-            print("No prompts provided. Returning empty maps.")
-            return (
-                np.zeros((H_proc, W_proc), dtype=np.float32),
-                np.zeros((H_proc, W_proc), dtype=np.float32)
-            )
+            print("No prompts provided. Returning empty map.")
+            return np.zeros((H_proc, W_proc), dtype=np.float32)
 
+        # 1. Collect positive prompt features
         pos_features = []
-        neg_features = []
         for prompt in self.prompts:
             y, x = prompt['coords']
-            if prompt['label'] == 1:
-                pos_features.append(self.hr_features[y, x])
-            else:
-                neg_features.append(self.hr_features[y, x])
+            pos_features.append(self.hr_features[y, x])
 
+        # 2. Calculate positive similarity map
         if pos_features:
             pos_map_flat = self._calculate_similarity(all_features, pos_features)
+            # Normalize from -1 to 1 (raw similarity) to 0 to 1
             pos_map_flat = (pos_map_flat + 1.0) / 2.0
         else:
             pos_map_flat = torch.zeros(H_proc * W_proc, device=self.device)
 
-        if neg_features:
-            neg_map_flat = self._calculate_similarity(all_features, neg_features)
-            neg_map_flat = (neg_map_flat + 1.0) / 2.0
-        else:
-            neg_map_flat = torch.zeros(H_proc * W_proc, device=self.device)
-
+        # 4. Reshape and return as numpy array
         pos_map = pos_map_flat.reshape(H_proc, W_proc).cpu().numpy()
-        neg_map = neg_map_flat.reshape(H_proc, W_proc).cpu().numpy()
-
-        return pos_map, neg_map
+        return pos_map
 
     @torch.no_grad()
     def get_low_res_similarity_map(self, original_coords: tuple) -> np.ndarray | None:
