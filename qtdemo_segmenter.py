@@ -467,7 +467,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--segmenter",
         type=str,
-        default="faiss",
+        default="torch",
         choices=["faiss", "torch"],
         help="Segmentation method. 'faiss' is constant-time, 'torch' is brute-force."
     )
