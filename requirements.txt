@@ -1,0 +1,37 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+numpy>=1.21.0
+pillow>=9.0.0
+
+# Computer vision and image processing
+opencv-python>=4.5.0
+scikit-image>=0.19.0
+
+# Scientific computing
+scipy>=1.8.0
+scikit-learn>=1.1.0
+matplotlib>=3.5.0
+
+# GUI for PyQt5 demos
+PyQt5>=5.15.0
+
+# Optional: For FAISS-based fast similarity search
+faiss-cpu>=1.7.0
+# Use faiss-gpu instead of faiss-cpu if you have GPU support
+
+# Optional: For Gradio web interface
+gradio>=3.0.0
+
+# Optional: For notebook examples
+jupyter>=1.0.0
+ipywidgets>=7.6.0
+
+# Optional: For advanced upsampling (requires specific installation)
+# torch-hub for loading AnyUp models
+# Note: Some models may need additional setup - see documentation
+
+# Development dependencies (optional)
+pytest>=7.0.0
+black>=22.0.0
